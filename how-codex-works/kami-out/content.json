@@ -1,0 +1,96 @@
+{
+  "type": "long-doc",
+  "lang": "cn",
+  "brief": {
+    "audience": "想理解 Codex CLI 整体架构的开发者",
+    "job": "把《how-codex-works》第 1 章总览排版为 Kami 羊皮纸长文档，作为技术文档展示与后续章节的统一格式样板",
+    "template": "long-doc",
+    "formats": [
+      "html",
+      "pdf"
+    ],
+    "page_target": 12,
+    "acceptance_checks": [
+      "10 个小节内容完整落入长文档结构，表格与架构图可读",
+      "无占位符残留，--check-placeholders 通过",
+      "PDF 中文字体为仓耳今楷，羊皮纸底色 + 藏青强调色"
+    ],
+    "explicit_deviations": []
+  },
+  "content": {
+    "title": "Codex CLI 架构解析",
+    "subtitle": "一个以 core 为中心的本地 AI 代理操作系统 —— 理解它要解决的核心工程问题、与 Codex Web 的差异、分层架构如何分工，以及一条用户请求从输入到工具执行再返回模型的完整路径。",
+    "author": "Ahuamao",
+    "date": "2026.08",
+    "summary": {
+      "claim": "Codex CLI 是 OpenAI 开源的本地 AI 编程助手。本章回答四个问题：它要解决的核心工程问题是什么、与 ChatGPT / Codex Web 的差异在哪、它的分层架构如何分工、一条用户请求从输入到工具执行再返回模型的完整路径是什么。读懂本章，就等于拿到了后续所有章节的地图。",
+      "takeaways": [
+        "Codex CLI 是运行在用户本机的命令行智能体，关键设计约束是必须在本机安全地执行不可信代码（模型生成的命令），同时提供流畅的交互体验。",
+        "架构以核心编排层 codex-core 为中心，把模型交互与本地执行解耦：tui 与 app-server 负责交互形态，exec-server 负责受控执行，core 只负责把输入编织成工具调用循环。",
+        "能力通过 Extensions、MCP、Skills、Plugins、Hooks 五种机制接入，大多数新增能力不需要修改核心循环。",
+        "安全是纵深防御加用户可控：分级权限 profile、沙箱模式、审批策略与 exec-server 进程隔离共同兜底。",
+        "代码库是单一大仓库 monorepo，Rust 工作区含 130+ crates（2026-08 为 134 个），鼓励拆 crate 以避免 core 变成无法维护的巨型 crate。"
+      ]
+    },
+    "chapters": [
+      {
+        "title": "执行摘要",
+        "claim": "Codex CLI 是一个以 core 为中心的本地 AI 代理操作系统：core 负责把用户输入、上下文、模型、工具编织成持续的 Turn 循环，tui / app-server 负责交互形态，exec-server 负责受控执行，ext / mcp / skills 负责能力接入而不污染核心。",
+        "paragraphs": [
+          "Codex CLI 是一个在用户本机运行的命令行智能体。它的核心职责是：接收自然语言指令，理解当前工作目录的代码上下文，自主或半自主地完成代码阅读、编辑、命令执行、测试运行等任务，并把结果反馈给用户。",
+          "Codex CLI 的架构可以总结为：一个以 core 为中心的本地 AI 代理操作系统。core 负责把用户输入、上下文、模型、工具编织成持续的 Turn 循环；tui / app-server 负责把这套能力包装成不同交互形态；exec-server 负责在受控环境中执行模型产生的动作；ext / mcp / skills 负责把不断新增的能力接入系统而不污染核心。",
+          "本章是后续所有章节的地图：读完你会理解 Codex CLI 要解决的核心工程问题、与 ChatGPT / Codex Web 的差异、它的四层架构如何分工，以及一条用户请求从输入到工具执行再返回模型的完整路径。下一章将沿着 codex-cli/bin/codex.js 到 codex-rs/cli/src/main.rs 的路径，解释它是如何从一次 shell 调用启动起来的。"
+        ]
+      },
+      {
+        "title": "项目定位与核心问题",
+        "claim": "Codex CLI 的关键设计约束是必须在本机安全地执行不可信代码，同时提供流畅的交互体验——这两个目标直接塑造了它的安全执行层、交互层与核心编排层三层分工。",
+        "paragraphs": [
+          "Codex CLI 与 OpenAI 其他 Codex 形态的差异在于运行位置与交互方式：CLI 是主体，在用户本地机器以终端 / TUI 交互；IDE 插件复用同一套后端能力；Desktop App 通过 codex app 启动复用 CLI 后端；Codex Web 则是完全不同的云架构。",
+          "安全执行层被抽成独立的 exec-server，通过进程隔离、沙箱策略、权限 profile 控制命令能读什么、写什么、访问什么网络。交互层被抽成 tui 加 app-server，让终端 UI、桌面应用、远程控制可以共享同一套后端状态机。核心编排层 codex-core 专注于把用户输入转化为模型上下文加工具调用循环，而不关心命令最终在哪个进程里跑。",
+          "如果把 Codex CLI 看作一个会写代码的聊天机器人，它的工程挑战包括：模型生成的命令可能破坏用户系统；终端 UI 要实时显示流式输出、文件变化、工具状态；要支持桌面应用、远程模式、MCP 服务器等多种形态；不同用户或项目需要不同模型、权限、提示词；新工具不断涌现；长会话上下文会超过模型窗口；多 Agent 协作可能失控。这些选择共同指向一个目标：把模型交互与本地执行解耦，把核心循环与具体能力解耦，从而让系统可以持续演进而不变成巨型 crate。"
+        ]
+      },
+      {
+        "title": "系统边界与分层架构",
+        "claim": "仓库根目录下有两个子系统：极薄的 codex-cli TypeScript 包装与包含 130+ crates 的 codex-rs Rust 工作区；后者按用户可见层、应用协议层、核心编排层、能力扩展层、本地执行层、基础设施层六层逻辑组织。",
+        "paragraphs": [
+          "codex-cli 是一个极薄的 TypeScript 包装，负责按平台找到 Rust 二进制并转发参数；codex-rs 是 Rust 工作区，包含 130+ crates（2026-08 为 134 个），是实际实现。",
+          "用户可见层由 cli、tui、app-server-* 组成，负责解析参数、启动终端 UI、启动桌面或远程服务入口。应用协议层定义前后端通信协议，支持同进程与远程两种传输。核心编排层 codex-rs/core 负责 Thread 生命周期、Session 状态机、模型调用、工具路由与 Agent 控制。能力扩展层把具体能力（搜索、记忆、图片生成等）注册为工具或上下文片段。本地执行层实际运行 shell 命令、管理沙箱、文件读写与进程生命周期。基础设施层负责模型后端、配置加载、会话持久化、日志追踪与认证。"
+        ]
+      },
+      {
+        "title": "核心数据流与关键抽象",
+        "claim": "一次交互请求从 TUI 经 app-server 协议进入 core 的 CodexThread，工具调用交给 exec-server 沙箱进程执行，结果回流为新的模型上下文形成多轮 ReAct 循环；Thread、Session、Turn、Agent 四个概念构成理解 Codex 的钥匙。",
+        "paragraphs": [
+          "TUI 不直接调用模型，它通过 app-server 协议与后端交互，这让桌面应用、远程模式、JSONL 模式可以复用同一套后端。CodexThread 是用户会话的句柄，真正的状态在 Session 里，一个 ThreadManager 可以管理多个 thread。",
+          "工具调用走 exec-server 而不是在 core 里直接执行系统命令，这是安全隔离的关键；结果会回流到模型上下文，形成多轮 ReAct 循环，直到模型给出最终回答或达到预算上限。",
+          "CodexThread 是用户与 Codex 一次连续对话的句柄，保存在 codex_rs/core/src/codex_thread.rs，内部持有 Arc<Session>、SessionIo、会话配置快照与 rollout 持久化路径。Session 是核心循环的拥有者，维护消息历史、追加用户输入、调用模型、分发工具调用并管理回合生命周期。一次 Turn 对应一次用户输入到模型响应到工具执行再到结果返回的完整循环。AgentControl 是 Codex 多 Agent 模式的控制中心，维护 AgentRegistry，提供 spawn_agent、send_input、send_inter_agent_communication 与并发预算控制；所有子 Agent 共享同一个 session_id，并通过 Weak<ThreadManagerState> 避免循环引用。"
+        ]
+      },
+      {
+        "title": "扩展、安全与设计取舍",
+        "claim": "Codex 的能力不是硬编码在 core 里的，而是通过 Extensions、MCP、Skills、Plugins、Hooks 五种机制扩展，注册进统一的 ExtensionRegistry；安全采用纵深防御加用户可控；一系列设计取舍支撑系统持续演进。",
+        "paragraphs": [
+          "Extensions 是原生 Rust 扩展，深度集成，例如 guardian-v2、goal、image-generation、memories、web-search、skills、queue、agent；MCP 通过 Model Context Protocol 接入外部工具；Skills 是声明式提示词或工作流片段；Plugins 是连接器或插件系统；Hooks 是工具调用生命周期钩子引擎，2026-08 起 MCP 工具调用也接入 hooks 引擎。",
+          "ExtensionRegistry 是统一注册中心，扩展可以注册 ToolContributor 提供新工具、ContextContributor 向模型上下文注入片段、TurnInputContributor 或 TurnItemContributor 在回合前后修改输入输出、ThreadLifecycleContributor 监听线程生命周期、ApprovalReviewContributor 参与审批决策。这种设计让大多数情况下新增能力不需要修改核心循环。",
+          "Codex CLI 的安全模型可以概括为纵深防御加用户可控：权限 Profile 是预定义的一组文件、网络、执行策略（如 read-only、workspace、dangerous）；沙箱模式决定命令的隔离环境（none、seatbelt、bwrap、windows 等）；审批策略支持 on-request（默认）、granular（按类别开关）、never，always 与 untrusted 已移除（2026-08，#39630）；exec-server 进程隔离与最小权限文件系统视图；network-proxy 对出站网络进行控制与日志记录。",
+          "关键设计取舍包括：单一大仓库 monorepo 而非多仓库，便于协议变更同步与统一构建；鼓励拆 crate 抵抗向 core 加代码；工具执行走 exec-server 隔离而非直接执行系统命令；UI 与后端通过 app-server 协议分离以支持 TUI、桌面、远程、JSONL 多种前端；配置采用分层加载加 lockfile；多 Agent 在同一 session 下共享 AgentControl 以便统一管控预算、并发与通信。"
+        ]
+      },
+      {
+        "title": "附录：关键实现入口",
+        "claim": "本章提到的所有概念都有明确的文件级入口，从 CLI 入口、TUI、核心库、Thread、Agent 控制、工具路由、执行服务器到扩展注册表，构成后续深入阅读的导航表。",
+        "paragraphs": [
+          "CLI 入口在 codex-rs/cli/src/main.rs，负责命令解析与子命令分发；NPM 包装在 codex-cli/bin/codex.js，按平台找到 Rust 二进制并 spawn；TUI 入口在 codex-rs/tui/src/lib.rs 的 run_main 与 run_ratatui_app。",
+          "核心库 codex-rs/core/src/lib.rs 是 codex-core 的公开 API；CodexThread 在 codex-rs/core/src/codex_thread.rs；AgentControl 与 AgentRegistry 在 codex-rs/core/src/agent/control.rs 与 registry.rs；工具路由与注册分别在 tools/router.rs 与 tools/registry.rs。",
+          "执行入口在 codex-rs/exec/src/lib.rs（非交互式 codex exec），执行服务器在 codex-rs/exec-server/src/lib.rs（沙箱执行服务）；扩展 API 在 codex-rs/ext/extension-api/src/lib.rs，注册表在 registry.rs；配置加载在 codex-rs/core/src/config/mod.rs；协议类型在 codex-rs/protocol/src/；会话历史类型在 codex-rs/history/src/lib.rs（2026-08 从 core 拆出，#37871）。"
+        ]
+      }
+    ],
+    "references": [
+      "OpenAI Codex CLI 官方仓库与文档：https://github.com/openai/codex",
+      "how-codex-works 系列 · 第 1 章：01-overview.md（本文来源）"
+    ]
+  }
+}

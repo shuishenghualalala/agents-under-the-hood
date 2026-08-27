@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Logs
+*.log
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor
+.idea/
+.vscode/
+*.code-workspace
+
+# Temp
+.tmp/
+temp/
+*.tmp
+
+# 本地归档（压缩包/镜像等大文件不入库）
+*.tar.gz
+*.zip
+*.tgz
+*.iso
