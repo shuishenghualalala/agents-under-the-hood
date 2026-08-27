@@ -1,5 +1,10 @@
 # 源码索引
 
+
+> **文档同步跟踪**
+> - 最后同步代码：`kimi-code` commit `c3a2ef0ce`（2026-08-27）
+> - 同步方式：基于该文档撰写时的源码路径与提交记录梳理
+
 这份索引列出当前拆解用到的主要源码入口。
 
 ## CLI / TUI
@@ -129,3 +134,22 @@
 - `apps/kimi-web/src/api/daemon/client.ts`
 - `apps/kimi-web/src/api/daemon/ws.ts`
 - `apps/kimi-desktop/src/main/index.ts`
+
+## agent-core-v2 / kap-server（v2 路径）
+
+- `packages/agent-core-v2/src/index.ts` — v2 引擎入口与导出。
+- `packages/agent-core-v2/src/app/bootstrap/bootstrapService.ts` — 启动与 App Scope 创建。
+- `packages/agent-core-v2/src/app/scopes.ts` — DI scope 枚举与拓扑。
+- `packages/agent-core-v2/src/_base/di/` — DI 内核（service / fiber / collection / cascade）。
+- `packages/agent-core-v2/src/features/` — 内建 Feature（plan / goal / swarm / tower / skill / externalHooks）。
+- `packages/agent-core-v2/src/workspace/workspaceInstance/` — Workspace 实例管理。
+- `packages/agent-core-v2/src/workspace/sessionLifecycle/sessionLifecycleService.ts` — Session 生命周期。
+- `packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts` — Agent 生命周期。
+- `packages/agent-core-v2/src/wire/` — wire 协议与 durable record。
+- `packages/kap-server/src/start.ts` — kap-server 启动。
+- `packages/kap-server/src/routes/` — REST 路由（v1 / v2）。
+- `packages/kap-server/src/transport/ws/v1/registerWsV1.ts` — WebSocket 注册。
+- `packages/kap-server/src/services/transcript/transcriptService.ts` — transcript 服务。
+- `packages/klient/src/core/klient.ts` — klient facade。
+- `packages/transcript/src/contract/` — transcript 协议类型。
+- `packages/minidb/src/` — 嵌入式 JSON 存储与搜索索引。

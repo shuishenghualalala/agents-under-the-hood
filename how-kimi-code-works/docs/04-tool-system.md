@@ -1,5 +1,10 @@
 # 第 4 章：Tool 系统与执行 Harness
 
+
+> **文档同步跟踪**
+> - 最后同步代码：`kimi-code` commit `c3a2ef0ce`（2026-08-27）
+> - 同步方式：基于该文档撰写时的源码路径与提交记录梳理
+
 > 本章导读：本章拆 Kimi Code 中 tool 的来源、注册、执行、权限和并发模型。读完后应该能回答三个问题：里面有哪些 tool；tool 调用从模型响应到 transcript 落盘经历哪些边界；普通多 tool 调用和 AgentSwarm 批量调用分别怎样并行。
 
 ## 4.1 这个系统解决什么问题
@@ -193,7 +198,90 @@ tool harness 还做了几类稳定性处理：
 - AgentSwarm 声明全局互斥并创建 queued tasks：`packages/agent-core/src/tools/builtin/collaboration/agent-swarm.ts:96`。
 - SubagentBatch 启动节流与并发限制：`packages/agent-core/src/session/subagent-batch.ts:11`。
 
-## 4.10 小结
+## 4.10 v2 视角：Tool 域的重新组织
+
+2026 年 7 月后的 v2 引擎保留了 tool 的核心生命周期，但在实现上做了大幅调整。读新代码时要把视线从 `packages/agent-core/src/loop/` 和 `packages/agent-core/src/agent/tool/` 转移到 `packages/agent-core-v2/src/agent/tools/` 和 `src/features/`。
+
+### 4.10.1 Tool 域被重新组织
+
+v2 里原来的 tool 相关代码被 consolidate 到 `packages/agent-core-v2/src/tool/` 和 `src/agent/tools/`（commit #1599）。
+
+- 静态注册、工具目录、execution 仍走 DI；
+- 工具实现以 Feature 形式贡献（`contributeTool`）；
+- Agent scope 通过 `IAgentToolExecutorService` 统一执行；
+- 权限 veto 事件也迁移到 Agent-scope Service。
+
+### 4.10.2 MCP 在 v2 里是分层的
+
+v2 的 MCP 不再是一个连接管理器，而是拆成三个管理域：
+
+| 域 | 职责 | v2 入口 |
+|---|---|---|
+| `mcpConfig` | 用户级 `mcp.json`、OAuth 凭据、配置段 | `packages/agent-core-v2/src/app/mcpConfig/` |
+| `mcpRegistry` | 统一只读视图（文件层 + 插件贡献） | `packages/agent-core-v2/src/app/mcpRegistry/` |
+| `mcpManagement` | CRUD、连接测试、OAuth 流程 | `packages/agent-core-v2/src/app/mcpManagement/` |
+| `workspaceMcp` | 工作区级 MCP 连接管理 | `packages/agent-core-v2/src/workspace/workspaceMcp/` |
+| `session/mcp` | 会话级 MCP handle 与临时 server 覆盖 | `packages/agent-core-v2/src/session/mcp/` |
+
+关键点：
+
+- v2 的 MCP 启用/禁用、name collision 规则与 v1 有**故意差异**（AGENTS.md 明确说明不要私自对齐）。
+- Workspace trust 控制是否加载项目级 `.mcp.json`。
+- Session 创建时可以传入 `mcpServers` 临时覆盖。
+- kap-server 暴露 `/api/v2/mcp/*` 管理面。
+
+### 4.10.3 动态工具加载
+
+v1 里 MCP tools 是静态发现后展开进 `loopTools`；v2 支持 **progressive tool disclosure**（`select_tools` → `dynamically_loaded_tools`，commit #1488）：
+
+- 模型可以先调用一个特殊工具声明它需要哪些动态工具；
+- 引擎只把这些工具加入当前上下文，而不是一次性暴露所有 MCP tools；
+- 对长工具列表的场景（比如 MCP server 有上百个工具）特别重要。
+
+入口：`packages/agent-core-v2/src/agent/tools/selectTools/` 或相关 Feature。
+
+### 4.10.4 `WaitFor` 工具
+
+v2 新增 `WaitFor`（CHANGELOG 0.38.0）：
+
+- 让 agent 在当前 turn 内阻塞等待一个后台任务完成；
+- 不再依赖后台任务完成后发 notification 触发下一轮；
+- 对 headless / print mode 的同步语义很关键。
+
+入口：`packages/agent-core-v2/src/features/task/`。
+
+### 4.10.5 `Edit` / `Write` 的 Read-first 约束
+
+v2 改了文件写入工具的安全语义（#3096）：
+
+- `Edit` 和 `Write` 现在要求先 `Read` 过目标文件；
+- 如果文件在 `Read` 后被磁盘修改，写入会被拒绝；
+- 这是为了强制 agent 基于真实文件状态做修改，避免覆盖外部变更。
+
+### 4.10.6 工具结果 side channel
+
+commit #1437 把 tool result 元数据移到一个结构化的 `note` side channel，不再全部塞进模型可见文本。这让 UI 可以显示更丰富的进度、状态和元信息，而不污染模型上下文。
+
+### 4.10.7 读 v2 Tool 代码的入口
+
+| 主题 | v2 入口 |
+|---|---|
+| Tool 执行器 | `packages/agent-core-v2/src/agent/toolExecutor/` |
+| 内置 OS 工具 | `packages/agent-core-v2/src/agent/tools/os/` |
+| MCP 配置 | `packages/agent-core-v2/src/app/mcpConfig/` |
+| MCP 注册表 | `packages/agent-core-v2/src/app/mcpRegistry/` |
+| MCP 管理面 | `packages/agent-core-v2/src/app/mcpManagement/` |
+| Workspace MCP | `packages/agent-core-v2/src/workspace/workspaceMcp/` |
+| 动态工具 | `packages/agent-core-v2/src/agent/tools/selectTools/` |
+| 任务 / WaitFor | `packages/agent-core-v2/src/features/task/` |
+
+## 4.11 小结
+
+Kimi Code 的 tool 系统可以概括为一句话：**ToolManager 决定模型能看见什么，loop 负责有序执行一个模型 step，TurnFlow 负责把权限、去重、compaction、hook、结果预算和 transcript 接到 loop 上。**
+
+v2 里这套语义被迁移到 DI × Scope + Feature 架构：工具注册、执行、MCP、动态工具、结果 side channel 都变成 Agent-scope Service 或 Feature 贡献。读新代码时，建议先看 `packages/agent-core-v2/src/features/` 里的相关 Feature，再下钻到 `src/agent/tools/` 和 `src/agent/toolExecutor/`。
+
+它支持并行，但并行是资源感知的；支持批量，但批量主要体现在 `AgentSwarm` 的子 Agent 队列调度中；支持动态工具，但只按需加载到当前上下文。这个设计避免了三个极端：既不是完全串行导致性能差，也不是裸 `Promise.all` 让文件写入、审批和 transcript 顺序失控，更不是一次性把上百个 MCP tools 全塞进 prompt。
 
 Kimi Code 的 tool 系统可以概括为一句话：**ToolManager 决定模型能看见什么，loop 负责有序执行一个模型 step，TurnFlow 负责把权限、去重、compaction、hook、结果预算和 transcript 接到 loop 上。**
 

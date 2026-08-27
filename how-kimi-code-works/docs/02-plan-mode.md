@@ -1,5 +1,10 @@
 # 02. Plan Mode 的设计与运行
 
+
+> **文档同步跟踪**
+> - 最后同步代码：`kimi-code` commit `c3a2ef0ce`（2026-08-27）
+> - 同步方式：基于该文档撰写时的源码路径与提交记录梳理
+
 Plan Mode 不是“让模型先写一段计划”这么简单的功能。它是一个**运行时约束机制**：在计划被用户批准之前，Agent 只能读取、思考、编辑计划文件本身，不能修改任何业务文件。只有用户批准后，Plan Mode 才退出，Agent 回到正常执行状态。
 
 这种设计的出发点是：复杂或高风险的改动需要先形成一份可审阅、可修订、可批准的方案，而不是边想边改。Plan Mode 把“规划”和“执行”切成了两个明确的阶段。
@@ -455,7 +460,66 @@ sequenceDiagram
 
 如果用户选择“修订”，流程不会退出 Plan Mode。模型会继续收到 Plan Mode 注入，并只能修改计划文件，直到再次提交审批。
 
-## 14. 小结
+## 14. v2 视角：Plan Mode 变成 Feature
+
+2026 年 7 月后的 v2 引擎保留了 Plan Mode 的全部产品语义，但实现方式从 v1 的“core 内部模块”变成了 `features/plan/` Feature。读新代码时注意以下变化。
+
+### 14.1 实现位置
+
+v2 的 Plan Feature 在 `packages/agent-core-v2/src/features/plan/`：
+
+- `planFeature.ts` —— Feature 装配单元，注册 `IAgentPlanService`、`EnterPlanMode` 工具、`ExitPlanMode` 工具；
+- `planService.ts` —— Agent-scope 服务，维护 plan 状态；
+- `configSection.ts` —— 配置段（静态注册）；
+- `profile/plan.ts` —— plan agent profile（静态注册）。
+
+### 14.2 状态持久化到 wire
+
+v1 里 plan 状态由 core Session 维护；v2 里 plan 状态通过 `IEventDispatcher` 的 replayable state 持久化，并通过 wire record 回放。
+
+计划文件本身仍保存在磁盘，但 `ExitPlanMode` 提交时会把计划内容 offload 到 `agents/<agentId>/plan/<planId>/v<N>.md`，wire 里只存引用（`{id, version, path, sha256, bytes}`）。这样 transcript 不会膨胀，计划版本也能追溯。
+
+### 14.3 注入机制改为 AgentReminder
+
+v1 里 Plan Mode 提醒通过动态注入器（`PlanModeInjector`）实现；v2 里所有模型面向的 reminder 都收敛到 **AgentReminder**（`packages/agent-core-v2/src/agent/runtimeBinding/agentRuntime.ts` 附近）：
+
+- restate 类提醒（plan mode、goal state、date change）走 `register(variant, provider)`；
+- 一次性事件（goal cancelled、AGENTS.md 发现、/init 完成）走 `notify(content, { variant })`；
+- reminder 统一包装成 `<system-reminder>`，标记 `kind: 'injection'`；
+- 这类 injection 对 UI 隐藏、不是 undo anchor、compaction 会丢弃。
+
+commit #3223 `refactor(agent-core-v2): merge contextInjector and systemReminder into reminder agent runtime domain` 完成了这次迁移。
+
+### 14.4 与 Goal、Tower 的关系
+
+v2 里 plan、goal、tower 都是 Feature，彼此独立但共享 AgentRuntime 的 reminder 注入点：
+
+- **Plan Mode**：阶段性的“方案 → 审批 → 执行”；
+- **Goal**：自主目标队列，可以跨多个 turn 推进；
+- **Tower**：worker 模式，把复杂任务组织成受控的多步执行。
+
+三者的注入都会通过 AgentReminder 竞争同一段模型上下文，因此 v2 特别注意 reminder 的排序和冲突处理。
+
+### 14.5 Web UI 的 plan review
+
+v2 的 kap-server / Web UI 支持 plan review：
+
+- `GET /sessions/{id}/transcript/plan?agent_id=` 可以直接投影 plan 信息（内容、路径、选项、审批结果）；
+- plan review 的反馈输入框会随内容自动增高；
+- 计划内容通过 transcript 的 `plan.revision` marker 投影。
+
+### 14.6 读 v2 Plan Mode 代码的入口
+
+| 主题 | v2 入口 |
+|---|---|
+| Plan Feature | `packages/agent-core-v2/src/features/plan/planFeature.ts` |
+| Plan Service | `packages/agent-core-v2/src/features/plan/planService.ts` |
+| Plan 配置段 | `packages/agent-core-v2/src/features/plan/configSection.ts` |
+| Plan profile | `packages/agent-core-v2/src/features/plan/profile/plan.ts` |
+| AgentReminder | `packages/agent-core-v2/src/agent/runtimeBinding/agentRuntime.ts` |
+| Transcript plan projection | `packages/transcript/src/contract/schema.ts`、`packages/kap-server/src/routes/transcript.ts` |
+
+## 15. 小结
 
 Plan Mode 的本质是一个**横切式的运行时阶段控制机制**。它把一次复杂任务切分为“规划阶段”和“执行阶段”，并通过多层机制保证这个切换可靠：
 

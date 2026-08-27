@@ -5,4 +5,5 @@
 - [04. Tool 系统与执行 Harness](docs/04-tool-system.md)
 - [05. 安全与权限机制](docs/05-security-and-permissions.md)
 - [06. 执行环境与宿主探测](docs/06-execution-environment.md)
+- [07. agent-core-v2 与 kap-server 新架构](docs/07-agent-core-v2.md)
 - [源码索引](docs/source-map.md)

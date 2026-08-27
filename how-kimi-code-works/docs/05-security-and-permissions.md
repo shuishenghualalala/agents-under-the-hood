@@ -1,5 +1,10 @@
 # 第 5 章：安全与权限机制
 
+
+> **文档同步跟踪**
+> - 最后同步代码：`kimi-code` commit `c3a2ef0ce`（2026-08-27）
+> - 同步方式：基于该文档撰写时的源码路径与提交记录梳理
+
 > 本章导读：kimi-code 的安全模型与多数同类工具不同——它**没有 OS 级沙箱**（无 seatbelt / landlock / sandbox-exec / bubblewrap / 容器），所有副作用操作的安全控制完全发生在**应用层的工具执行拦截**上。读完本章你会理解：一次工具调用经过怎样的策略链裁决、审批往返如何阻塞执行、规则如何用 glob 匹配、工作区信任如何防恶意 checkout，以及"白名单 + 审批"模型相对"沙箱隔离"模型的取舍。建议先读 [第 4 章 Tool 系统](04-tool-system.md) 了解工具执行 harness。
 
 ## 5.1 这个机制解决什么问题
@@ -243,6 +248,66 @@ kimi-code 选前者，换来的是：**轻量、跨平台行为完全一致、�
 | 安全工具白名单 | `packages/agent-core-v2/src/agent/permissionPolicy/policies/default-tool-approve.ts` |
 | ACP 协议层审批映射 | `packages/acp-adapter/src/approval.ts` |
 | UI 审批组件 | `apps/kimi-code/src/tui/components/dialogs/`、`apps/vscode/webview-ui/src/stores/approval.store.ts` |
+
+## 5.10 v2 视角：安全模型的演进
+
+> 注意：本章 5.10 的“关键实现入口”已经以 v2 路径为主，因为权限域在 v2 里被完整重写。下面补充几个 v2 带来的关键变化。
+
+### 5.10.1 权限系统被拆成 Service 组合
+
+v2 不再有一个单体的 `PermissionManager`。权限被拆成多个 Agent-scope / Session-scope Service：
+
+- `IAgentPermissionPolicyService` —— 12 策略有序遍历；
+- `IAgentPermissionGateService` —— 挂 `onBeforeExecuteTool` veto 事件；
+- `IAgentToolApprovalService` —— 审批往返编排；
+- `ISessionApprovalService` —— 交互内核 broker；
+- `IAgentPermissionModeService` —— 权限模式（manual / auto / yolo）。
+
+这种拆分让每个职责有明确的生命期和依赖方向，也更容易通过 Feature 注入额外策略。
+
+### 5.10.2 OAuth 与托管认证
+
+v2 引入了统一的 OAuth 层：
+
+- `packages/oauth` 处理 Kimi 账号的 OAuth 登录（kimi.ai / kimi.com）；
+- `packages/agent-core-v2/src/app/auth/` 管理请求头和认证状态；
+- `IMcpOAuthService` 负责 MCP server 的 OAuth 凭据刷新和生命周期。
+
+这意味着权限不再只是“工具能不能执行”，还包括“模型能不能代表用户访问外部 OAuth 服务”。
+
+### 5.10.3 远程 MCP 的认证
+
+远程 MCP server 可能要求登录。v2 提供了 OAuth authenticate tool（#3083）：
+
+- 当 MCP server 需要认证时，模型可以调用 authenticate 工具；
+- 用户完成 OAuth 流程后，凭据由 `IMcpOAuthService` 持久化并自动刷新；
+- 已认证的 server 后续调用不再弹窗。
+
+入口：`packages/agent-core-v2/src/app/mcpManagement/mcpManagementService.ts`、`packages/agent-core-v2/src/app/mcpConfig/oauthService.ts`。
+
+### 5.10.4 Workspace Trust 在 v2 里是工作区级 Service
+
+v1 的 `WorkspaceTrustService` 在 v2 里变成 `IWorkspaceTrust`（Workspace scope）：
+
+- 信任标记仍持久化在 workspace 之外（用户 home 下）；
+- 标记按 `encodeWorkDirKey(root)` 索引；
+- 未信任时，`workspaceMcpConfig` 跳过项目级 MCP 配置文件。
+
+入口：`packages/agent-core-v2/src/workspace/workspaceTrust/workspaceTrustService.ts`。
+
+### 5.10.5 ACP 协议的审批映射
+
+kimi-code 支持 ACP（Agent Client Protocol），让 IDE 等外部客户端接入。`packages/acp-adapter/src/approval.ts` 负责把 v2 的审批事件映射到 ACP 协议消息，使 IDE 弹窗与 TUI/Web 弹窗共享同一套内核语义。
+
+### 5.10.6 Edit / Write 的 Read-first 约束
+
+v2 在工具层加了安全约束（#3096）：
+
+- `Edit` 和 `Write` 要求先 `Read` 目标文件；
+- 写入时校验文件自上次 Read 以来是否被磁盘修改；
+- 若被修改则拒绝，防止 agent 覆盖外部变更。
+
+这属于“工具自身安全语义”，不经过策略链。
 
 ## 5.11 小结
 

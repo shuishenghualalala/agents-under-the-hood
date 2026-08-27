@@ -1,5 +1,10 @@
 # 03. Subagent 与委托任务的设计与运行
 
+
+> **文档同步跟踪**
+> - 最后同步代码：`kimi-code` commit `c3a2ef0ce`（2026-08-27）
+> - 同步方式：基于该文档撰写时的源码路径与提交记录梳理
+
 Subagent 不是“多开几个模型请求”这么简单。它是 Kimi Code 用来解决两个工程问题的机制：
 
 1. **并行化独立工作**：例如同时调查三个主题、同时审阅多处改动、同时让多个 agent 分别处理一批文件。
@@ -264,7 +269,69 @@ TUI 根据事件更新三类界面：
 **为什么用 profile 而不是子类？**  
 子 Agent 之间共享同一套 Agent runtime，差异主要是角色提示和工具集。用 profile 表达差异，比为每种子 Agent 复制一套执行器更轻，也更容易扩展。
 
-## 12. 小结
+## 12. v2 视角：Subagent 模型的变化
+
+2026 年 7 月后的 v2 引擎（`packages/agent-core-v2`）保留了 `Agent` / `AgentSwarm` 的模型层语义，但运行调度层被重新组织进 DI × Scope 架构。读新代码时要注意这些变化：
+
+### 12.1 运行调度层换了实现
+
+v1 的 `SessionSubagentHost`、`SubagentBatch`、`BackgroundManager` 是对象方法组合；v2 里对应的概念被拆成 Feature 和 Agent-scope Service。相关 Feature 在 `packages/agent-core-v2/src/features/` 下：
+
+- `features/swarm/` —— 对应原来的 `AgentSwarm` 批量调度；
+- `features/goal/` —— 对应自主目标执行；
+- `features/tower/` —— 新的 Tower 模式。
+
+v2 的每个子 Agent 是一个独立的 **Agent Scope**，有自己的 loop、tool executor、state dispatcher，生命周期由 `IAgentLifecycleService` 管理。详见 [07. agent-core-v2 与 kap-server 新架构](07-agent-core-v2.md)。
+
+### 12.2 `WaitFor` 工具
+
+v2 新增了 `WaitFor` 工具（CHANGELOG 0.38.0，commit 相关 #3060）：
+
+- 允许 agent **在当前 turn 内等待一个后台任务完成**，而不是结束 turn、等任务通知触发下一轮。
+- 解决了“后台任务还没跑完，主 Agent 就过早继续”的问题。
+- 对 print mode（`kimi -p`）尤其重要：它让 headless 运行可以同步等待子 Agent。
+
+源码入口：`packages/agent-core-v2/src/features/task/` 或 `src/agent/tools/` 中名为 `WaitFor` 的工具实现。
+
+### 12.3 Tower 模式
+
+Tower 是 v2 里一个实验性 Feature（通过 flag 开启），用于把复杂的多步任务组织成受控的 worker 模式。关键变化：
+
+- Tower 移除了“command queue”（commit #3193 `fix(tower): remove command queue`），不再用队列派发命令，而是走更直接的 runtime 绑定。
+- 有专门的 `tower-worker` profile 和 eleven `Tower*` 工具。
+- Tower 的 orchestration manual 通过 reminder injection 注入。
+
+源码入口：`packages/agent-core-v2/src/features/tower/`。
+
+### 12.4 子 Agent 默认不再创建子 Agent
+
+v2 改了默认行为（#3012）：
+
+- 子 Agent 默认**不能**再创建自己的子 Agent，防止无限嵌套。
+- 如果某个自定义 agent profile 明确允许，仍可开启。
+
+这个改动让委托树的深度变得可控，避免模型在子 Agent 里继续无节制地 spawn。
+
+### 12.5 Background / foreground 的展示改名
+
+v2 的 Web UI 把“Subagent panel”改名为 **Background Agent panel**，并修复了多个前台/后台任务归属问题：
+
+- 前台 subagent 不再错误地出现在 Background Agent panel；
+- 后台任务可取消的时间窗口修复；
+- 取消或异常结束的后台任务不再显示为已完成。
+
+### 12.6 读 v2 代码的入口
+
+| 主题 | v2 入口 |
+|---|---|
+| Agent 生命周期 | `packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts` |
+| Swarm Feature | `packages/agent-core-v2/src/features/swarm/` |
+| Goal Feature | `packages/agent-core-v2/src/features/goal/` |
+| Tower Feature | `packages/agent-core-v2/src/features/tower/` |
+| Task / WaitFor | `packages/agent-core-v2/src/features/task/` |
+| 子 Agent profile catalog | `packages/agent-core-v2/src/app/agentProfileCatalog/` |
+
+## 13. 小结
 
 Kimi Code 的委托体系可以概括成三层：
 

@@ -1,14 +1,50 @@
 # 01. 整体架构
 
+
+> **文档同步跟踪**
+> - 最后同步代码：`kimi-code` commit `c3a2ef0ce`（2026-08-27）
+> - 同步方式：基于该文档撰写时的源码路径与提交记录梳理
+
 如果只看目录，Kimi Code 像一个常见的 monorepo：有 CLI、有 Web、有 Desktop、有 SDK、有 server、有 core。
 
-但从运行时看，它更像是围绕 `Agent Core` 建了多层壳：
+但从运行时看，它更像是围绕 `Agent Core` 建了多层壳。需要特别说明：从 2026 年 7 月开始，仓库里并存着两套 Agent Core——
 
-- `apps/kimi-code` 把 core 包成命令行和 TUI。
-- `packages/node-sdk` 把 core 包成 TypeScript SDK。
-- `packages/server` 把 core 包成本地 daemon。
-- `apps/kimi-web` 和 `apps/kimi-desktop` 通过 daemon 远程控制同一套 core。
-- `packages/agent-core` 才是 Session、Agent、工具、权限、loop 的主战场。
+- **v1**：`packages/agent-core`，本文 1–13 节描述的架构。
+- **v2**：`packages/agent-core-v2`，基于 DI × Scope 的新引擎，详见 [07. agent-core-v2 与 kap-server 新架构](07-agent-core-v2.md)。
+
+在默认情况下：
+
+- CLI / TUI / `kimi -p` 已经默认走 v2，除非设置 `KIMI_CODE_LEGACY_FLAG=1`。
+- `kimi web` 永远启动 `packages/kap-server`，背后就是 v2。
+- Web / Desktop 不再走 `packages/server`，而是走 `kap-server`。
+
+所以从 2026 年开始，原图需要扩展成两条并行路径：
+
+```mermaid
+flowchart TD
+  subgraph legacy["v1 legacy 路径（KIMI_CODE_LEGACY_FLAG=1）"]
+    LCLI["apps/kimi-code CLI/TUI"] --> LSDK["packages/node-sdk v1"]
+    LSDK --> LSrv["packages/server"]
+    LSrv --> LCore["packages/agent-core"]
+  end
+
+  subgraph v2["v2 默认路径"]
+    CLI["apps/kimi-code CLI/TUI/-p"] --> SDK2["packages/node-sdk v2 mapper"]
+    SDK2 --> V2Core["packages/agent-core-v2"]
+    Web["apps/kimi-web / apps/kimi-desktop"] --> Kap["packages/kap-server"]
+    Kap --> V2Core
+    Klient["packages/klient facade"] --> V2Core
+  end
+
+  V2Core --> Transcript["packages/transcript"]
+  V2Core --> MiniDb["packages/minidb"]
+  LCore --> Kosong["packages/kosong"]
+  V2Core --> Kosong
+  LCore --> Kaos["packages/kaos"]
+  V2Core --> Kaos
+```
+
+下面 1–13 节仍按 v1 路径讲解，因为 v1 的源码结构和概念是理解 v2 的基础；v2 的完整心智模型请转 07。
 
 ## 1. 仓库分层
 
@@ -22,9 +58,14 @@ kimi-code/
     kimi-desktop/    # Electron desktop wrapper
     vis/             # 可视化辅助应用
   packages/
-    agent-core/      # Agent runtime 核心
-    node-sdk/        # SDK 入口，给 CLI 或外部程序使用
-    server/          # 本地 REST + WebSocket daemon
+    agent-core/      # Agent runtime 核心（v1 引擎）
+    agent-core-v2/   # 新 Agent runtime 核心（v2 引擎，DI × Scope）
+    kap-server/      # 基于 agent-core-v2 的 REST + WebSocket daemon
+    klient/          # v2 统一客户端 facade（memory / ipc / rest）
+    transcript/      # 同构转录数据层（浏览器 + 服务器共享）
+    minidb/          # 嵌入式 JSON 文档存储（搜索索引）
+    node-sdk/        # SDK 入口，给 CLI 或外部程序使用（桥接 v1 / v2）
+    server/          # 本地 REST + WebSocket daemon（v1 后端）
     protocol/        # REST / WS schema 和事件类型
     acp-adapter/     # Agent Client Protocol 适配
     kaos/            # 执行环境抽象
@@ -424,6 +465,8 @@ Plan Mode、权限、工具、LLM loop、skills、MCP、hooks 都在 core 里，
 
 真正的模型-工具循环被拆到 `loop/`，并且刻意不持有 session 和 transport。这让它更像一个可测试、可替换的执行内核。
 
+需要补充的一点是：这套图在 2026 年 7 月之后变成了**默认路径的 legacy 路径**。读新代码时，CLI / TUI 入口应先看 `apps/kimi-code/src/cli/experimental-v2.ts`、`apps/kimi-code/src/cli/run-shell.ts`、`apps/kimi-code/src/cli/run-prompt.ts`；Web 入口应直接看 `packages/kap-server/src/start.ts` 和 `packages/klient/src/core/klient.ts`。详细的双引擎对比与 v2 架构见 [07. agent-core-v2 与 kap-server 新架构](07-agent-core-v2.md)。
+
 从读源码的角度，建议后续按这个顺序继续下钻：
 
 ```text
@@ -439,3 +482,16 @@ main.ts
   -> loop/tool-call.ts
 ```
 
+如果你关注的是 2026 年之后的默认行为，建议的读码顺序是：
+
+```text
+apps/kimi-code/src/cli/experimental-v2.ts   # 判断走 v1 还是 v2
+apps/kimi-code/src/cli/run-shell.ts          # TUI 默认 v2
+apps/kimi-code/src/cli/run-prompt.ts         # kimi -p 默认 v2
+packages/kap-server/src/start.ts             # kimi web 永远走这里
+packages/agent-core-v2/src/app/bootstrap/bootstrapService.ts
+packages/agent-core-v2/src/app/sessionManager/sessionManagerService.ts
+packages/agent-core-v2/src/workspace/sessionLifecycle/sessionLifecycleService.ts
+packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts
+packages/agent-core-v2/src/agent/loop/
+```
