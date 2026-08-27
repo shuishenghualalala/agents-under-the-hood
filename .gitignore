@@ -28,6 +28,9 @@ venv/
 temp/
 *.tmp
 
+# 生成产物（kami-out 等）
+how-codex-works/kami-out/
+
 # 本地归档（压缩包/镜像等大文件不入库）
 *.tar.gz
 *.zip
