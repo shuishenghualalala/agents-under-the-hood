@@ -19,6 +19,7 @@
 - [05. 安全与权限机制](docs/05-security-and-permissions.md)
 - [06. 执行环境与宿主探测](docs/06-execution-environment.md)
 - [07. agent-core-v2 与 kap-server 新架构](docs/07-agent-core-v2.md)
+- [08. Session 持久化与恢复](docs/08-session-persistence.md)
 - [源码索引](docs/source-map.md)
 
 ## 一句话总览
@@ -57,7 +58,7 @@ flowchart TD
 
 ## 当前覆盖范围
 
-这版覆盖七个主题：
+这版覆盖八个主题：
 
 1. 从入口到 Agent Loop 的整体架构（v1 路径）。
 2. Plan Mode 的状态、注入、权限、UI 审批和退出流程。
@@ -66,6 +67,7 @@ flowchart TD
 5. 安全与权限机制：应用层策略链、异步审批、glob 规则、工作区信任。
 6. 执行环境与宿主探测：借宿主而非造环境、PATH 补全、Windows bash 定位。
 7. **agent-core-v2 与 kap-server 新架构**：DI × Scope、四层生命期、Feature 装配、Workspace 实例、Session / Agent 生命周期、kap-server 协议面、klient facade、v1/v2 切换。
+8. **Session 持久化与恢复**：v1 的 SessionStore/AgentRecords、v2 的 ISessionIndex/ISessionMetadata/IWireService、wire.jsonl 协议与迁移、transcript 冷重建。
 
 后续可以继续按同样风格补：
 

@@ -135,6 +135,30 @@
 - `apps/kimi-web/src/api/daemon/ws.ts`
 - `apps/kimi-desktop/src/main/index.ts`
 
+## Session 持久化与恢复（v1 / v2）
+
+- packages/agent-core/src/session/store/session-store.ts - v1 Session CRUD/fork/archive/delete/reindex
+- packages/agent-core/src/session/store/session-index.ts - v1 全局 session_index.jsonl
+- packages/agent-core/src/agent/records/persistence.ts - v1 FileSystemAgentRecordPersistence
+- packages/agent-core/src/agent/records/types.ts - v1 AgentRecordEvents
+- packages/agent-core/src/agent/records/index.ts - v1 replay / restore
+- packages/agent-core/src/agent/replay/index.ts - v1 ReplayBuilder
+- packages/agent-core/src/services/session/sessionService.ts - v1 上层 SessionService
+- packages/agent-core-v2/src/app/sessionIndex/sessionIndex.ts - v2 ISessionIndex
+- packages/agent-core-v2/src/app/sessionIndex/sessionIndexService.ts - v2 读模型投影
+- packages/agent-core-v2/src/app/sessionIndex/sessionIndexProjector.ts - v2 权威扫描与 reconcile
+- packages/agent-core-v2/src/app/sessionManager/sessionManagerService.ts - v2 ISessionManager
+- packages/agent-core-v2/src/workspace/sessionLifecycle/sessionLifecycleService.ts - v2 生命周期
+- packages/agent-core-v2/src/workspace/sessionLifecycle/internal/forkTurnSlice.ts - v2 fork 截断
+- packages/agent-core-v2/src/workspace/sessionLifecycle/coldSessionArchive.ts - v2 冷归档
+- packages/agent-core-v2/src/session/sessionMetadata/sessionMetadataService.ts - v2 ISessionMetadata
+- packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts - v2 Agent 创建/恢复
+- packages/agent-core-v2/src/wire/wireService.ts - v2 IWireService
+- packages/agent-core-v2/src/wire/record.ts - v2 WireRecord
+- packages/agent-core-v2/src/wire/migration/migration.ts - v2 wire 迁移
+- packages/transcript/src/history/groupTurns.ts - transcript turn 树冷重建
+- packages/transcript/src/history/foldFacts.ts - transcript facts 冷重建
+
 ## agent-core-v2 / kap-server（v2 路径）
 
 - `packages/agent-core-v2/src/index.ts` — v2 引擎入口与导出。

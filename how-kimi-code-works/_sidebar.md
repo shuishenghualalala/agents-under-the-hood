@@ -6,4 +6,5 @@
 - [05. 安全与权限机制](docs/05-security-and-permissions.md)
 - [06. 执行环境与宿主探测](docs/06-execution-environment.md)
 - [07. agent-core-v2 与 kap-server 新架构](docs/07-agent-core-v2.md)
+- [08. Session 持久化与恢复](docs/08-session-persistence.md)
 - [源码索引](docs/source-map.md)
