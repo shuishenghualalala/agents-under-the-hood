@@ -10,6 +10,7 @@
 agents-under-the-hood/
 ├── how-codex-works/            # Codex —— Agent 核心原理拆解
 ├── how-codex-security-works/   # Codex 安全机制拆解
+├── how-deepseek-harness-works/ # DeepSeek Harness —— Agent 拆解
 └── how-kimi-code-works/        # Kimi Code —— Agent 实现拆解
 ```
 
