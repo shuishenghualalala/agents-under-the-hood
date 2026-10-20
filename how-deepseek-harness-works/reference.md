@@ -61,6 +61,43 @@
 | `packages/compaction/compaction-basic/src/region.ts:463` | replace op 摘要写入 |
 | `packages/llm/token-meter/src/index.ts:188` | 日志回放式计量 |
 
+## 上下文压缩
+
+| 文件 | 职责 |
+|---|---|
+| `packages/compaction/compaction/src/index.ts` | `CompactionEngine` SD；触发类型与手动错误分类 |
+| `packages/compaction/compaction/src/types.ts` | `compaction/start`/`summary`/`end`/`prune` 事件；`CompactionResult` |
+| `packages/compaction/compaction/src/tool-pairing.ts` | 工具调用/结果配对平衡；边界检查缓存 |
+| `packages/compaction/compaction/src/checkpoint.ts` | 摘要 checkpoint 的 provenance 构造与识别 |
+| `packages/compaction/compaction/src/invariant.ts` | 压缩 bracket、turn 边界、checkpoint provenance 校验 |
+| `packages/compaction/compaction-basic/src/index.ts:137` | 自动压力/溢出监听器注册；`compactIfNeeded` |
+| `packages/compaction/compaction-basic/src/index.ts:258` | 压力与溢出恢复的 `compactIfNeeded` 主路径 |
+| `packages/compaction/compaction-basic/src/index.ts:343` | `compactRegion`：强制压缩 surface 区间 |
+| `packages/compaction/compaction-basic/src/index.ts:368` | `compactNow`：手动 idle-session 压缩与 flush |
+| `packages/compaction/compaction-basic/src/region.ts:98` | `selectCompactableRange`：保留尾、工具配对边界 |
+| `packages/compaction/compaction-basic/src/region.ts:152` | `compactSurfaceRegion`：完整事务与锁 |
+| `packages/compaction/compaction-basic/src/summarizer.ts:121` | `summarizeWithLlm`：复用 prefix cache 的默认摘要 |
+| `packages/compaction/compaction-basic/src/config.ts` | 配置解析、目标策略、容量缩放 |
+| `packages/compaction/compaction-tool-result-pruner/src/index.ts:136` | `pruneSession`：无模型工具结果截断 |
+| `packages/compaction/command-compact/src/index.ts` | `/compact` 命令注册与失败文案 |
+| `packages/core/session/src/surface.ts:83` | `deriveEventMessage`；surface fold 与 replace 校验 |
+| `packages/core/session/src/surface.ts:387` | `foldSurface`：日志 → surface 投影 |
+| `packages/core/session/src/index.ts:726` | `deriveMessages`：缓存式消息派生 |
+| `packages/llm/token-meter/src/index.ts:116` | `TokenMeter.measure`：日志回放式压力计量 |
+| `packages/llm/token-meter/src/surface-fold.ts:42` | priced surface fold；shadow-price 协议落地 |
+
+## 运行时日志、Trace 与遥测
+
+| 文件 | 职责 |
+|---|---|
+| `vendor/cordis/src/logger.ts:183` | `LoggerService`；命名 logger；exporter 注册；内存 buffer |
+| `vendor/logger-console/src/shared.ts:28` | 控制台 exporter，可选插件 |
+| `packages/session/session-telemetry/src/index.ts:148` | `SessionTelemetryBackend` SD；record 格式；`sharing` 策略 |
+| `packages/session/session-telemetry/src/coordinator.ts:60` | capture 协调器：live/on-demand、投影、脱敏、handoff cursor |
+| `packages/session/session-telemetry-otel/src/index.ts:147` | OTel backend：mode 解析、SDK pipeline、shutdown deadline |
+| `packages/bundle/base/cordis.patch.yml:148` | 默认 telemetry 配置：`DISABLED`、OTLP endpoint、processor 参数 |
+| `packages/boot/app-boot/src/index.ts:80` | 启动阶段 `warn` 回调，默认写 `process.stderr` |
+
 ## LLM 层
 
 | 文件 | 职责 |
@@ -113,6 +150,22 @@
 | `packages/subagent/subagent/src/index.ts:171` | SubagentRuntime；`:212` startContinuable |
 | `packages/subagent/subagent/src/continuation.ts:349` | Activation 管理器；`:883` coldResume |
 | `packages/subagent/tool-subagent/src/index.ts:392` | 三种委派入口（continuable/jobs 后台/前台） |
+
+subagent 族细分（[第 9 章](09-编排能力.md) 9.1–9.5 对照，锚点以 `0.1.0-rc.8` 为准）：
+
+| 文件 | 职责 |
+|---|---|
+| `packages/subagent/subagent/src/types.ts` | seam 发布契约：Provider/Run/Result/capabilities/ContinuableCreateSpec |
+| `packages/subagent/subagent/src/{descriptor,projection,list-children,depth,child-agent}.ts` | 身份描述符、投影与三级阶梯列举、深度单调记账、创建窗口装配 |
+| `packages/subagent/subagent/src/out-of-process.ts` | 跨进程后端公共底座：NO_START_CAPABILITIES、settleRunResult、subprocessRunHandle |
+| `packages/subagent/subagent/src/activation-setup-registry.ts` | continuable 子级创建窗口的事务化 setup 注册表 |
+| `packages/subagent/subagent-in-process-driver/src/{index,structured}.ts` | one-shot 进程内驱动；structured output 工具协议 |
+| `packages/subagent/subagent-{spawn,fork}-in-process/src/` | 两个进程内 provider（64/94 行，极薄） |
+| `packages/subagent/subagent-codex/src/wire.ts` | Codex app-server 协议适配层（744 行） |
+| `packages/subagent/subagent-claude-code/src/process.ts` | SDK spawn → subprocess seam 投影适配 |
+| `packages/subagent/tool-subagent-control/src/{index,list-agents}.ts` | send_message / interrupt_agent / list_agents |
+| `packages/subagent/tool-subagent-report/src/index.ts` | 子级 report 工具（经 registerContinuableSetup 注入） |
+| `apps/cli/config/agent-presets/standard/agent.cordis.yml:174-220` | 随附接线：subagent(spawn) + subagent_fork(fork)；codex/claude-code 休眠 |
 | `packages/preset/agent-presets/` | preset roster |
 | `packages/jobs/jobs/src/index.ts:62` | JobRegistry SD |
 | `packages/workflow/workflow/src/index.ts:157` | WorkflowEngine SD |

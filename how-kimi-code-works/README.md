@@ -20,6 +20,7 @@
 - [06. 执行环境与宿主探测](docs/06-execution-environment.md)
 - [07. agent-core-v2 与 kap-server 新架构](docs/07-agent-core-v2.md)
 - [08. Session 持久化与恢复](docs/08-session-persistence.md)
+- [09. Tool Defer 机制与全量工具清单](docs/09-tool-defer.md)
 - [源码索引](docs/source-map.md)
 
 ## 一句话总览

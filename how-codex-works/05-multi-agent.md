@@ -1,585 +1,444 @@
-# 第 5 章：Multi-Agent 与 Agents
+# 第 5 章：Agent 与多 Agent 控制
 
-> 本章导读：Codex CLI 不仅能“一个模型会话完成任务”，还支持一个 root agent 根据需要 spawn 多个 sub-agent，让它们并行或协作完成复杂任务。读完本章，你会理解 Codex 中 Agent 与 Thread 的关系、`AgentControl` 如何管理整个 agent 树、子 Agent 的 spawn 全链路（配置继承、历史 fork、昵称分配）、Agent 之间如何通信与等待结果、V1 与 V2 两套多 Agent 协议的差异，以及并发、深度、驻留（residency）三层资源控制机制。
+> 本章导读：Codex CLI 不只能“一个会话干到底”，还能让主 Agent 按需派生多个子 Agent 并行协作。读完本章，你会理解：一个子 Agent 在运行时到底是什么、父子 Agent 如何组成一棵树并被寻址、spawn 一个子 Agent 的完整过程（配置怎么继承、历史怎么 fork）、Agent 之间靠什么机制收发消息和等待结果、为什么同时存在 V1/V2 两套协议，以及并发、深度、驻留三层资源闸门分别挡什么。
+
+本章按“先立心智模型，再走运行时流程”的顺序展开——先弄清 Agent 是什么（5.2）、谁来管（5.3）、以什么身份出现（5.4），然后跟着一次 spawn 走完全程（5.5），看 Agent 之间如何通信与等待（5.6），最后收束到版本差异、资源控制与设计取舍：
+
+| 小节 | 回答的问题 |
+|------|-----------|
+| 5.1 要解决的问题 | 单 Agent 执行在哪些场景会遇到瓶颈 |
+| 5.2 核心抽象 | 一个 Agent 在运行时到底是什么、如何被寻址 |
+| 5.3 控制中心与注册表 | 一棵树的状态由谁保管、生命周期怎么走 |
+| 5.4 角色系统 | 同一个模型如何安全地扮演不同身份 |
+| 5.5 Spawn 全流程 | 从一次工具调用到一个跑起来的子 Agent |
+| 5.6 通信与等待 | 消息怎么投递、父 Agent 怎么等结果 |
+| 5.7 V1 与 V2 | 两套协议差在哪、运行时选哪套 |
+| 5.8 资源控制 | 并发、深度、预算、驻留四层闸门 |
+| 5.9 教给模型 | 协作纪律如何写进提示词 |
+| 5.10 设计取舍 | 关键选择的替代方案与理由 |
 
 ## 5.1 本章要解决的问题
 
-当用户交给 Codex 一个复杂任务时，单线程单模型的执行方式会遇到瓶颈：
+当用户交给 Codex 一个复杂任务时，“一个会话串行做所有事”会遇到瓶颈：
 
 - 一个 Agent 同时只能做一件事，无法并行探索多个方案；
-- 长任务容易让上下文窗口爆炸；
-- 不同子任务需要不同角色（如“安全审查员”、“测试工程师”、“文档作者”）；
+- 长任务容易把上下文窗口撑爆；
+- 不同子任务适合不同角色（如“安全审查员”、“测试工程师”、“文档作者”）；
 - 子任务失败不应该拖垮整个主任务。
 
-Multi-Agent 系统要解决：
+Multi-Agent 系统要回答五个问题：**Agent 如何表示与寻址、如何创建（配置/历史/权限怎么继承）、如何通信与等待结果、资源如何被限制、以及新旧两套协议如何共存**。
 
-1. **如何表示 Agent**：Agent 是独立进程还是线程？如何寻址？
-2. **如何创建 Agent**：spawn 时如何继承配置、历史、权限？
-3. **Agent 如何通信**：消息、任务、结果的传递机制；父 Agent 如何等待/收集结果。
-4. **如何限制资源**：并发数、层级深度、token budget、常驻内存。
-5. **不同版本协议**：V1 与 V2 有什么区别？
+## 5.2 核心抽象：一个 Agent 就是一个对话线程
 
-## 5.2 核心设计：Agent ≈ Thread
+### 5.2.1 Agent ≈ Thread
 
-在 Codex CLI 中，**一个 Agent 本质上就是一个 `CodexThread` / `Session`**。它与普通用户会话的区别在于：
+Codex 没有为“子 Agent”发明新的运行时。**一个子 Agent 就是一条普通的对话线程（Thread/Session）**——它跑的是第 4 章那套一模一样的循环：接收输入、开 turn、采样、调工具、回流结果。它与用户直接交互的根会话只有三个差别：
 
-- `SessionSource` 是 `SubAgent(ThreadSpawn { parent_thread_id, depth, agent_path, agent_nickname, agent_role })` 而不是 `Cli` / `Vscode`；
-- 它通过共享的 `AgentControl` 注册到同一个 session 树中；
-- 它可以被父 Agent 通过工具调用 `spawn_agent`、`send_message`、`wait_agent` 等管理；
-- 它同样可以再 spawn 自己的 sub-agent（受深度与并发限制）。
+1. **出身不同**：创建记录里带着父线程是谁、在树里的第几层、路径和昵称、扮演什么角色；
+2. **户口不同**：它挂在同一棵树共享的控制中心（AgentControl）下，而不是独立会话；
+3. **可被管理**：父 Agent 可以通过工具对它发消息、等结果、打断、再派生自己的子 Agent（受深度限制）。
 
-这种设计的好处是：
+这个抽象带来三个直接收益：
 
-- **复用现有基础设施**：Agent 拥有与普通会话完全相同的 Session、Turn、Tool 循环；
-- **统一持久化**：Agent 的历史同样走 rollout / thread-store 持久化，V2 agent 还会持久化 spawn 边（spawn edge），供后续会话恢复整棵树；
-- **统一沙箱**：Agent 的工具执行同样受权限体系约束。
+- **基础设施零新增**：子 Agent 自动拥有完整的 Session、Turn、工具循环能力；
+- **持久化统一**：子 Agent 的对话历史走和主会话相同的持久化通道；V2 还会把“谁 spawn 了谁”这条父子边（spawn edge）也持久化下来，会话恢复时能重建整棵树；
+- **沙箱统一**：子 Agent 执行命令、改文件，走同一套权限与沙箱体系（第 7 章）。
 
-另外有一个值得强调的语义（也是 V2 usage hint 中向模型明说的）：**所有 Agent 共享同一个容器、文件系统和当前工作目录**。一个 Agent 的文件编辑对其他所有 Agent 立即可见——这是协作模型的基础，而不是每个 Agent 一份隔离工作区。
+另一个重要语义（V2 会把它明说给模型听）：**同一棵树里的所有 Agent 共享同一个容器、文件系统和当前工作目录**。一个 Agent 改的文件，其他 Agent 立刻可见——协作建立在共享工作区之上，而不是每个 Agent 一份隔离副本。
 
-## 5.3 Agent 树与 AgentPath
+### 5.2.2 树形寻址：每个 Agent 有一条“文件路径”
 
-Codex 用 `AgentPath` 给每个 Agent 一个类文件系统的路径。定义在 `codex-rs/protocol/src/agent_path.rs`：
+树上的每个 Agent 都有一条类文件系统的路径：`/root` 是用户直接交互的根 Agent，`/root/task_1` 是根派生的第一个子 Agent，`/root/task_1/task_2` 是孙 Agent，以此类推。
 
-```rust
-pub struct AgentPath(String);
+路径不是随意拼接的字符串，创建和解析时有硬校验：
 
-impl AgentPath {
-    pub const ROOT: &str = "/root";
-    pub const MORPHEUS: &str = "/morpheus";
-    // ...
-}
-```
-
-- `/root`：用户直接交互的根 Agent；
-- `/root/task_1`：root spawn 的第一个子 Agent（用 task name 命名）；
-- `/root/task_1/task_2`：子 Agent 再 spawn 的孙 Agent。
-
-### 5.3.1 路径规则是硬校验
-
-`AgentPath` 不是简单字符串拼接，而是一组**强制校验**：
-
-| 规则 | 说明 |
+| 规则 | 效果 |
 |------|------|
-| 绝对路径必须以 `/root` 开头 | 否则拒绝（另一个合法值是特殊的 `/morpheus`，用于 root 子树之外的系统级命名空间——从代码结构推断是云端编排类 Agent 的预留位） |
+| 绝对路径必须以 `/root` 开头 | 其余一律拒绝（唯一的例外是保留命名空间 `/morpheus`，从代码结构推断是给 root 树之外的系统级/云端编排 Agent 预留的） |
 | 不能以 `/` 结尾 | 尾斜杠非法 |
-| 每段名字只能用小写字母、数字、下划线 | `BadName`、"task 3" 都会被拒 |
-| `root`、`.`、`..` 是保留段 | 不能作为任何一段的名字 |
+| 每段名字只允许小写字母、数字、下划线 | 空格、大写、连字符都会被拒 |
+| `root`、`.`、`..` 是保留段名 | 不能用作任何一段的名字 |
 
-尤其要注意最后一条与直觉的差异：`resolve("../sibling")` 会直接报错 "agent_name `..` is reserved"。**相对引用只能向下挂载**（join 到自己下面），不能向上逃逸或横跳；跨分支通信要用对方的完整规范名（canonical name）。这个限制把 Agent 树的引用结构约束成了真正的树，避免任意图状寻址带来的生命周期混乱。
+最后一条决定了树的形状：**相对引用只能向下挂载，不能向上逃逸、也不能横向跳到兄弟分支**。想引用别的分支下的 Agent，必须给出从 `/root` 开始的完整路径。这个限制把引用关系钉死成真正的树，避免了任意图状寻址带来的“这个 Agent 到底归谁管、什么时候该被回收”的混乱。
 
-### 5.3.2 join 与 resolve
+日常使用中，父子之间互称短名（`task_3`）或全路径（`/root/task_1/task_3`）都可以；只有跨分支引用才必须用全路径。这条规则也被直接写进了 V2 spawn 工具给模型的描述里。
 
-- `join(agent_name)`：在当前路径后追加一段，spawn 时用它构造子 Agent 路径；
-- `resolve(reference)`：解析模型给出的目标引用。传 "/root/x" 这类绝对路径按绝对路径处理；其余当作相对路径拼到当前路径下。
+## 5.3 控制中心与注册表：一棵树的状态由谁保管
 
-配套地，`name()` 返回路径最后一段（如 `/root/task_1` 的 `task_1`），工具输出和 TUI 展示都靠它生成人类可读的短名。父 Agent 和子 Agent 可以互换使用 `task_3` 或 `/root/task1/task_3` 称呼同一个子 Agent，但别的分支下的 `/root/task2/task_3` 只能用规范全名访问（这也是 V2 spawn 工具描述里明确教给模型的规则）。
+### 5.3.1 AgentControl：每棵树一份的控制面
 
-## 5.4 AgentControl：多 Agent 控制中心
+整棵 Agent 树共享**一份**控制中心：由根会话创建，之后树里每个子 Agent 拿到的都是它的克隆句柄。也就是说，注册表、并发名额、token 预算的作用域都是“一棵 root 树”，而不是整个进程——两棵不相干的会话树互不影响。
 
-`AgentControl` 在 `codex-rs/core/src/agent/control.rs` 中，是 Multi-Agent 系统的控制面。它**每个 root session 树至多创建一份**，由根 Session 构造，随后克隆给该树下每一个 sub-agent 的 `SessionServices`——注册表的作用域因此被限定在一棵 root 树内，而不是整个 `ThreadManager`。
+它在运行时要管的事：
 
-```rust
-pub(crate) struct AgentControl {
-    /// 整棵 agent 树共享同一个 session id
-    session_id: SessionId,
-    /// Weak 回指全局线程表，打断循环引用
-    manager: Weak<ThreadManagerState>,
-    /// 构造时捕获，使子代理沿用 manager 的线程 id 分配策略
-    thread_id_generator: ThreadIdGenerator,
-    state: Arc<AgentRegistry>,
-    v2_residency: Arc<V2Residency>,
-    agent_execution_limiter: Arc<AgentExecutionLimiter>,
-    /// root 与所有子代理共享的预算
-    rollout_budget: Arc<RolloutBudget>,
-}
+- **出生**：创建子 Agent（详见 5.5），负责把新线程登记进树；
+- **投递**：把一条消息送达目标 Agent——目标空闲就为它开一个新 turn，目标正在忙就把消息并进它当前的 turn（steer），调用方不需要关心目标此刻的状态；
+- **状态**：回答“某个 Agent 现在跑到哪了”，并支持订阅状态变化；
+- **关停**：关闭单个 Agent，或连同它的全部存活后代一起关停；
+- **寻址**：把模型给出的路径引用翻译成实际的线程。
+
+一个值得一提的内存设计：控制中心回指全局线程表时用的是弱引用，刻意打断“线程表 → 线程 → 会话 → 控制中心 → 线程表”这个引用环。一旦全局线程表被释放，控制中心的所有操作会统一失败，并向上翻译成模型能看懂的“collab manager unavailable”，而不是悬着一份永远等不到的“影子”会话。
+
+两个自愈性质的行为：
+
+- **死掉的 Agent 自动销户**：如果向某个 Agent 投递时发现它已经死了，控制中心会顺手把它从线程表移除、清掉驻留记录、释放注册表名额——尸体不会占着并发额度；
+- **完成自动通知**：子 Agent spawn 出来后，系统会挂一个后台观察者盯它的状态。一旦进入终态，观察者就向父 Agent 投一条完成通知。V1 的做法是把格式化好的通知文本悄悄写进父的上下文（不触发新 turn）；V2 则走标准邮箱，投一条 FINAL_ANSWER 类型的消息（5.6.3）。父 Agent 因此不需要轮询子 Agent 的死活。
+
+此外，spawn 前控制中心会从父线程快照两份运行期资产——当前生效的环境选择和命令执行策略——交给子 Agent 沿用；V2 驻留驱逐（5.8.4）时这两份资产会被存起来，将来重载时原样恢复。
+
+### 5.3.2 注册表：双索引 + 两阶段预留
+
+注册表保管树中每个 Agent 的元数据（线程 id、路径、昵称、角色）。它维护**两个方向的索引**：按路径查线程（寻址用），按线程反查元数据（状态汇报、驱逐恢复用）。重新注册同一个 Agent 时会先清理旧条目，保证两个索引永不漂移。
+
+spawn 不是“直接写注册表”，而是分两阶段：
+
+1. **预留**：先原子地占住一个数量名额（超限直接拒绝），再占住目标路径、抽一个昵称；
+2. **提交**：线程真正创建成功后，才把元数据正式登记。
+
+关键在于预留凭证带有自动回滚语义：只要中途任何一步失败、凭证被丢弃，路径占位和数量名额都会被自动撤销。所以 spawn 流程无论在哪一步死掉，都不会留下半截注册状态，也不会泄漏并发名额。
+
+### 5.3.3 昵称池：101 位科学家
+
+每个子 Agent 除了路径，还会分到一个人类可读的昵称。默认昵称池是编译期内嵌的 101 位科学家名字（Euclid、Archimedes、Hypatia、Galileo……），角色配置也可以提供自己的候选名单。
+
+分配规则：从未被占用的名字里随机挑一个；101 个全用完后清空已用集合、开启第二轮，第二轮起昵称带序号后缀——`Archimedes the 2nd`、`Euclid the 13th`。昵称纯属展示用途（TUI、工具输出里的人类可读短名），**寻址永远走路径和线程 id**。
+
+### 5.3.4 Agent 状态机
+
+Agent 的生命周期状态不是单独维护的，而是从会话事件流推导出来的：turn 开始就是 Running，turn 正常结束就是 Completed，被中断就是 Interrupted，依此类推：
+
+```mermaid
+stateDiagram-v2
+    [*] --> PendingInit : 注册完成
+    PendingInit --> Running : 第一个 turn 开始
+    Running --> Completed : turn 正常完成（携带最后一条回答）
+    Running --> Interrupted : 被用户或父 Agent 中断
+    Running --> Errored : turn 因错误中止
+    Interrupted --> Running : 收到新任务，继续跑
+    Running --> Shutdown : 被关闭
+    Completed --> [*]
+    Errored --> [*]
+    Shutdown --> [*]
 ```
 
-`manager` 用 `Weak<ThreadManagerState>` 是为了避免循环引用与“影子持久化”：`ThreadManagerState → CodexThread → Session → SessionServices → AgentControl → ThreadManagerState`。`upgrade()` 失败（manager 已释放）时所有操作统一返回 "thread manager dropped"，handler 层再把这类错误翻译成模型可读的 "collab manager unavailable"。
+注意 **Interrupted 不是终态**：被中断的 Agent 还活着，随时可能收到新任务继续干活。这一点直接影响后面的资源管理——V2 的驻留驱逐（5.8.4）只驱逐“终态附近、邮箱已清空、没有正在跑的 turn”的 Agent，条件与状态机的终态判定严格对齐。
 
-`AgentControl` 提供的关键能力：
+另外，暴露给模型的状态视图比内部状态窄：模型在工具输出里只能看到 `pending_init / running / interrupted / shutdown / not_found` 这几个字符串，外加“已完成（附最终回答）”“已出错（附原因）”两种带负载的形态。内部实现的细节不会透出。
 
-| 方法 | 作用 |
-|------|------|
-| `spawn_agent` / `spawn_agent_with_metadata` | 创建子 Agent，初始输入为用户输入（前者仅测试用例直接使用） |
-| `spawn_agent_with_communication` | 创建子 Agent，初始输入为 Inter-Agent 通信（V2 主路径） |
-| `send_input` | 向指定 Agent 发送用户输入；底层走 `start_or_steer_turn`，能 start 新 turn 也能 steer 进行中的 turn |
-| `send_inter_agent_communication` | 发送消息/任务/结果；`trigger_turn=true` 时先做执行容量检查 |
-| `interrupt_agent` | 向指定 Agent 发送 `Op::Interrupt` |
-| `get_status` / `subscribe_status` | 查询/订阅 Agent 状态（watch channel） |
-| `resolve_agent_reference` | 把路径引用解析为 `ThreadId` |
-| `list_agents` / `list_live_agent_subtree_thread_ids` | 列出活跃 Agent / 某节点的活体子树 |
-| `register_session_root` | 把无父线程注册为 `/root` |
-| `close_agent` / `shutdown_live_agent` / `shutdown_agent_tree` | 关闭单个 Agent 或连同其全部活体后代 |
+## 5.4 角色系统：同一个模型如何扮演不同身份
 
-几个值得注意的实现细节：
+角色（Agent Role）让同一个底层模型在不同子 Agent 中表现出不同行为——比如一个只读分析员、一个能改代码的 worker。角色来源有两个：Codex 内置的角色文件，以及用户在 config.toml 里定义的 `[agent_roles]`。spawn 时不指定角色就用默认角色。
 
-- **steer 时的 submission_id**：MAv1 对外暴露的是不透明的 `submission_id`。当消息被 steer 进进行中的 turn 时，底层 API 返回的是当前活动 turn id；为了让每次调用对模型可见的 id 保持唯一，控制层会用一个新的 UUIDv7 补齐（没有为此专门加回执类型）。
-- **自愈式清理**：`handle_thread_request_result` 发现请求因 `InternalAgentDied` 失败时，顺手把它从线程表移除、清掉 residency 记录、释放注册表槽位——死掉的 Agent 不会占着名额。
-- **子环境继承**：spawn 前从父线程快照两样运行期资产——`TurnEnvironmentSnapshot`（环境选择）与共享的 `ExecPolicyManager`（命令执行策略，仅在父子策略兼容时复用同一实例）；residency 驱逐时会把这些保存进注册表，重载时原样恢复。
+### 5.4.1 角色是“受限叠加层”，不是自由改配置
 
-### 5.4.1 完成通知：completion watcher
+应用一个角色时，系统把角色定义反序列化成一组**白名单覆盖项**，压到子 Agent 的配置层之上。能覆盖的只有：developer instructions、模型与推理档位、输出详略、人格、服务档位、能力开关、技能裁剪。其中能力开关**只允许做减法**——角色可以关掉 Shell、应用、记忆、权限请求等能力，但不能打开父会话没有的能力。
 
-非 V2 的子 Agent 在 spawn 完成后会启动一个 detached watcher（`maybe_start_completion_watcher`）：订阅该线程的状态流直到进入终态，然后向父线程注入一条格式化好的完成通知（`format_subagent_notification_message`），以 `inject_user_message_without_turn` 的方式进入父上下文，不触发新 turn。
+源码注释把设计边界写得很明白：**“Roles may customize the child or reduce its capabilities, but never replace the parent session's authority.”** 角色可以让子 Agent 变弱（更受限），绝不能让它越过父会话的权限。角色加载内部出错时，对外统一报一个模糊的“agent type is currently not available”，避免把配置细节泄露给模型。
 
-V2 不走这条路注入 user message：watcher 发现子 Agent 带 agent path 且走 V2 时，改发一条 `trigger_turn=false` 的 FINAL_ANSWER 类型 Inter-Agent 通信回父节点（见 5.9.3），投递交给统一的邮箱队列调度。
+### 5.4.2 两条重要的组合规则
 
-## 5.5 AgentRegistry：Agent 树状态
+- **全量 fork 与换角色互斥**（V1）：选择完整继承父历史的子 Agent 必须连同父的角色一起继承，不允许同时指定别的角色——否则等价于让一个“冒充者”带着新身份去读父的全部历史，工具调用会被直接拒绝。
+- **重载时先存后还**（V2）：被驱逐的驻留 Agent 重新载入时要重放角色覆盖，但审批策略、工作目录、权限快照这些**运行期决定**会先取出来，叠完角色层后再原样写回——重载不会让角色的静态配置顶掉用户在会话中做过的动态审批决定。
 
-`AgentRegistry` 在 `codex-rs/core/src/agent/registry.rs` 中，维护当前 session 树中所有 Agent 的元数据：
+## 5.5 Spawn 全流程：从一次工具调用到一个跑起来的子 Agent
 
-```rust
-pub(crate) struct AgentRegistry {
-    active_agents: Mutex<ActiveAgents>,
-    total_count: AtomicUsize,
-}
+模型在一次 turn 中调用 `spawn_agent`，给一个任务名和一段任务描述，几十毫秒后树上就多了一个在跑的子 Agent。中间发生了什么：
 
-struct ActiveAgents {
-    agent_tree: HashMap<String, AgentMetadata>,       // path -> metadata
-    thread_paths: HashMap<ThreadId, RegisteredAgent>, // thread -> path（+ 被驱逐环境）
-    used_agent_nicknames: HashSet<String>,
-    nickname_reset_count: usize,
-}
-
-pub(crate) struct AgentMetadata {
-    pub(crate) agent_id: Option<ThreadId>,
-    pub(crate) agent_path: Option<AgentPath>,
-    pub(crate) agent_nickname: Option<String>,
-    pub(crate) agent_role: Option<String>,
-}
+```mermaid
+flowchart TD
+    A["模型调用 spawn_agent<br/>task_name + 任务描述"] --> B{"参数校验<br/>fork 模式 / 角色 / 模型覆盖"}
+    B -->|不合法| B1["报错给模型，无副作用"]
+    B --> C{"裁定协议版本 V1 / V2<br/>显式配置 > 模型声明 > 默认开关"}
+    C --> D{"执行并发与驻留名额检查<br/>满了先尝试驱逐最久未用的已完成 Agent"}
+    D -->|无可驱逐者| D1["报名额已满"]
+    D --> E["注册表两阶段预留<br/>占数量名额、占路径、抽昵称"]
+    E --> F{"继承父历史吗？"}
+    F -->|不继承| G["创建全新空白线程"]
+    F -->|全部 / 最近 N 轮| H["物化父历史 → 白名单筛选<br/>→ 指令净化 → 按需截断"]
+    G --> I["正式提交注册<br/>广播新线程、持久化父子边"]
+    H --> I
+    I --> J["初始任务投入子 Agent 邮箱<br/>触发它的第一个 turn"]
+    J --> K["子 Agent 进入与父完全相同的<br/>采样 → 工具 → 回流循环"]
 ```
 
-注意它是**双索引**：path 索引用于寻址（`agent_id_for_path`），thread id 索引用于反查元数据和保存“被驱逐环境”。重新注册同一线程或同一路径时会清理旧条目，保证两个索引不漂移。
+### 5.5.1 参数校验：在动手之前拒绝
 
-### 5.5.1 SpawnReservation：原子预留 + 失败自动回滚
+handler 层先做严格校验（多给未知字段都直接拒绝）：
 
-spawn 不是一把梭写进注册表，而是走两阶段：
+- **fork 模式**：V2 用 `fork_turns` 表达——不填默认全量继承，`none` 表示空白起步，填正整数 N 表示只带最近 N 轮历史；填 0 报错。V1 的旧参数 `fork_context`（布尔）在 V2 里会被拒绝并提示换写法；
+- **初始任务**：任务描述必须非空；也可以用结构化内容（文本/图片/音频/skill 引用等）代替纯文本，但两种方式二选一，同时给或都不给都报错；
+- **子路径**：用“父路径 + 任务名”拼出子 Agent 的规范路径（如 `/root` + `task_3` → `/root/task_3`），并过一遍 5.2.2 的路径校验。
 
-1. `reserve_spawn_slot(max_threads)`：CAS 递增 `total_count`（超限返回 `AgentLimitReached`），拿到一个 `SpawnReservation`；
-2. 在 reservation 上继续预留 agent path、昵称；
-3. 线程真正建好后 `commit(metadata)` 正式登记。
+### 5.5.2 子配置构建：继承“当前生效状态”，而不是克隆旧配置
 
-关键是 `SpawnReservation` 实现了 `Drop`：若持有期间发生错误而没有 commit，Drop 会撤销 path 占位并把计数减回去。于是 spawn 流程中间任何一步失败都不会留下半截注册状态，也不会泄漏并发名额。
+子 Agent 的配置起点不是父 Session 启动时的旧配置，而是**父当前这个 turn 的生效状态**——模型、provider、推理档位、developer instructions 都以“此刻实际在用的”为准。在此之上，有四样“活的状态”被强制同步给子 Agent：审批策略、当前工作目录、权限档案快照、审批人设置。源码注释明言：漏掉这一步，子 Agent 就会在审批策略、工作目录、沙箱上和父会话不一致——这在多 Agent 共享文件系统的模型下是实打实的安全问题。
 
-### 5.5.2 昵称池：101 位科学家
+然后才轮到可选覆盖，每层都有校验兜底：
 
-昵称池来自 `codex-rs/core/src/agent/agent_names.txt` 编译期内嵌的 101 个科学家名（Euclid、Archimedes、Hypatia、Galileo……）：
+| 覆盖项 | 取值优先级 | 校验 |
+|--------|-----------|------|
+| 模型 / 推理档位 | 调用参数 > 用户配置的默认子 Agent 模型 > 父当前值 | 模型必须在可用列表里且支持多 Agent 后端；档位必须被该模型支持 |
+| 服务档位 | 显式参数 > 配置 > 父当前值 | 必须被子模型支持 |
+| 角色 | `agent_type` 参数 | 应用角色后如果模型/档位变了，还要重新校验档位合法性 |
 
-- 角色可以通过 role config 的 `nickname_candidates` 提供自己的候选名单，否则用默认池；
-- 分配时从未占用集合里随机挑一个；全耗尽则清空已用集合、`nickname_reset_count += 1`，进入第二轮编号（并打一个 `codex.multi_agent.nickname_pool_reset` 指标）；
-- 第二轮起昵称带序号后缀：`Archimedes the 2nd`、`Euclid the 13th`（11–13 固定 th，其余按个位数 st/nd/rd/th）。
+工具描述里最多只向模型展示 5 个可选模型，且只展示支持相应后端的——不给模型“选了也白选”的选项。
 
-昵称是纯展示用途；寻址永远走 agent path / thread id。
+### 5.5.3 落地：注册、持久化、首发任务
 
-### 5.5.3 Agent 数量与层级限制
+校验和配置都就绪后（对应上图的 E → K）：
 
-数量：`reserve_spawn_slot` 的上限按协议版本取值（见 5.11 配置矩阵）。到达上限的新 spawn 直接得到 `AgentLimitReached`。
+1. 注册表两阶段预留（5.3.2）：占名额、占路径、抽昵称；如果这是本树第一次 spawn，顺带把父线程正式登记为 `/root`；
+2. 建线程：按是否 fork 走空白创建或历史继承（5.5.4），带上父子环境继承关系；
+3. 正式提交注册；向客户端广播“新线程出现了”；**把父子边持久化**——这条边是 V2 会话恢复时重建整棵树的依据；
+4. 把初始任务投进子 Agent 的邮箱并触发它的第一个 turn（V2 主路径走标准邮箱投递，5.6.2）；
+5. 挂完成观察者（5.3.1），向 UI 发一条“子 Agent 已开始”的活动条目，让界面能画出这棵树。
 
-层级：`DEFAULT_AGENT_MAX_DEPTH = 1`（core/src/config/mod.rs）。也就是说默认情况下**只有 root 能 spawn 一层**，除非显式调高 `config.agent_max_depth`：
+### 5.5.4 Fork：历史继承的真实算法
 
-```rust
-pub(crate) fn next_thread_spawn_depth(session_source: &SessionSource) -> i32;
-pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bool; // depth > max_depth
-```
+“继承父历史”远比复制粘贴对话记录精细，分四步：
 
-深度检查有两道闸门（见 5.12 与 5.10.2）：工具是否暴露给模型时查一次（spec_plan.rs），实际执行 spawn/resume handler 时再查一次。
+**第一步，物化父历史。** 历史落盘是异步排队的，fork 之前必须先把缓冲区里的内容全部刷写完毕，否则快照会漏掉最近几轮。
 
-## 5.6 Agent 状态机
-
-Agent 的状态由 `AgentStatus` 定义（位于 `codex-rs/protocol/src/protocol.rs`）：
-
-```rust
-pub enum AgentStatus {
-    PendingInit,
-    Running,
-    Interrupted,
-    Completed(Option<String>),   // Completed 携带 last_agent_message
-    Errored(String),
-    Shutdown,
-    NotFound,
-}
-```
-
-状态转换由 `codex-rs/core/src/agent/status.rs` 中的 `agent_status_from_event` 从 Session 发出的事件推导：
-
-| 事件 | 状态 |
-|------|------|
-| `TurnStarted` | `Running` |
-| `TurnComplete` | `Completed(last_agent_message)` |
-| `TurnAborted(Interrupted / BudgetLimited)` | `Interrupted` |
-| `TurnAborted(其他原因)` | `Errored(...)` |
-| `Error` | `Errored(message)` |
-| `ShutdownComplete` | `Shutdown` |
-
-`is_final` 判定终态：除 `PendingInit`、`Running`、`Interrupted` 外都是终态。注意 `Interrupted` 不算终态——被中断的 Agent 还可能收到新任务继续跑。这与 V2 的 residency 驱逐条件（只驱逐“Completed/Errored/Interrupted 且 mailbox 清空且无活动 turn”的 Agent）是一致的。
-
-工具层面还有一个更窄的线缆视图（wire schema，出现在 spawn/wait/list 等 output schema 里）：五个字符串枚举 `pending_init` / `running` / `interrupted` / `shutdown` / `not_found` 加上 `{completed: string|null}`、`{errored: string}` 两个对象形态。Protocol 枚举的内部细节不会全量透出给模型。
-
-## 5.7 Agent 角色（Agent Roles）
-
-角色系统让同一个底层模型在不同 Agent 中表现出不同行为。定义位置：
-
-- 内置角色：随 codex 分发的 role config 文件（`codex-rs/core/src/agent/role.rs` 解析加载）；
-- 用户自定义：config.toml 中的 `[agent_roles]`（解析逻辑在 `codex-rs/core/src/config/agent_roles.rs`）。
-
-未指定 `agent_type` 时使用默认角色 `DEFAULT_ROLE_NAME = "default"`。
-
-### 5.7.1 角色是“受限叠加层”，不是自由改配置
-
-`apply_role_to_config`（`codex-rs/core/src/agent/role.rs`）的工作方式：
-
-1. 按 role name 解析出 `AgentRoleConfig`（找不到直接报 unknown agent_type）；
-2. 加载角色的 TOML 层，反序列化为一组**白名单化的覆盖项**：developer_instructions、model、model_reasoning_effort、model_reasoning_summary、model_verbosity、personality、service_tier、features、skills；
-3. features 只允许做减法——能关掉的只有 ShellTool / Apps / Personality / Plugins / MemoryTool / RequestPermissionsTool 这几类能力开关；
-4. skills 也只能裁剪：保留其中要求禁用的项，忽略 max_context_tokens 之类无关字段；
-5. 以配置层（layer）的形式压入 ConfigLayerStack，保持 layer 体系的一致性。
-
-源码注释点明了设计边界：**“Roles may customize the child or reduce its capabilities, but never replace the parent session's authority.”** 角色可以收窄子 Agent 的能力（比如做一个只读分析员），但不能替父会话扩大权限。加载角色内部出错时对外统一映射成模糊的 "agent type is currently not available"，避免向模型泄露配置细节。
-
-### 5.7.2 角色与全量 fork 的互斥约束
-
-V1 有一个明确的组合规则（`reject_full_fork_agent_type_override`）：全量历史 fork 的子 Agent 继承父 Agent 的角色，**不允许同时传 `agent_type` 覆盖**——否则等价于让子 Agent 冒充另一个角色去读父的全部历史，工具调用会被直接拒绝。
-
-### 5.7.3 重载时的角色再现
-
-V2 resident agent 从持久化存储重新载入（`ensure_v2_agent_loaded`）时要重新应用角色，但用“先存后还”的方式保住运行期状态：approval policy、cwd、permission profile snapshot 先取出现值，叠完角色层后再原样写回。这样重载不会让角色的静态覆盖顶掉会话的动态审批决定。
-
-## 5.8 Spawn 一个 Agent
-
-V2 的入口链路从工具 handler 开始：`multi_agents_v2/spawn.rs` 的 `handle_spawn_agent` → `AgentControl::spawn_agent_with_communication` → `spawn_agent_internal`（`codex-rs/core/src/agent/control/spawn.rs`）。
-
-### 5.8.1 参数解析与校验（handler 层）
-
-`SpawnAgentArgs` 是 deny_unknown_fields 的严格反序列化：message、task_name 必填；可选 agent_type、model、reasoning_effort、service_tier、fork_turns。
-
-- **fork_mode 解析**：`fork_context` 在 V2 直接拒绝（提示改用 fork_turns）；`fork_turns` 缺省视为 all，接受 none / all / 正整数字符串（0 报错），分别对应 无 fork / 全量 fork / 截断最近 N 轮。
-- **初始内容**：message 必须非空；同一段解析代码也支持 V1 风格的结构化 items（text/image/local_image/audio/skill/mention），与 message 二选一，同时给或都不给都报错。
-- **构造子路径**：`parent_agent_path.join(task_name)` 得到子 Agent 的 canonical path（如 /root + task_3 → /root/task_3）。
-
-### 5.8.2 子配置构建：继承的是什么
-
-`build_agent_spawn_config`（multi_agents_common.rs）给出了标准答案——**从“当前 turn 的生效状态”出发，而不是克隆父 Session 的陈旧配置**：
-
-1. 从父的 effective config 克隆起点；
-2. 刷新运行期归属字段：model（turn.model_info.slug）、provider、reasoning effort/summary、developer instructions（V2 且配置了 `subagent_developer_instructions` 时替换之）、base instructions 及其 provenance；
-3. `apply_spawn_agent_runtime_overrides` 强制同步四件“活的状态”：approval policy、cwd、permission profile 快照、approvals reviewer——源码注释明言跳过这一步会让子 Agent 在审批策略、cwd、沙箱上与父会话不一致。
-
-在此基础上依次叠加可选覆盖，每一层都有验证兜底：
-
-| 覆盖项 | 来源（优先级从高到低） | 校验 |
-|--------|------------------------|------|
-| model / reasoning_effort | 调用参数 > `agent_default_subagent_model` / `agent_default_subagent_reasoning_effort` 配置 | 必须存在于 models manager 列表且支持 multi-agent backend；effort 必须被所选模型支持 |
-| service_tier | 显式参数 > config > parent | 必须被子模型支持；三者皆空则置 None |
-| agent_role | agent_type 参数（trim 后非空才生效） | apply 之后若 model/effort 变了还要重新验证 effort 合法性 |
-
-工具描述里列出的可覆盖模型清单最多 5 个（`MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5`），只展示 picker 可见且支持相应后端的模型。
-
-### 5.8.3 spawn_agent_internal：七步落地
-
-`spawn_agent_internal` 的核心步骤：
-
-1. **确定协议版本**：`effective_multi_agent_version_for_spawn` 综合 feature flag、session source、父线程与配置决定 V1/V2（优先序详见 5.10.2）。
-2. **执行容量检查**：V2 子 Agent 受 `AgentExecutionLimiter` 限制，无余量即抛 AgentLimitReached。
-3. **预留 residency slot**（V2 常驻模式，见 5.11.4）——先拿 pending slot，满员就尝试驱逐 LRU 候选。
-4. **注册表预留**：`reserve_spawn_slot` + `prepare_thread_spawn`——depth==1 时顺带把父线程注册为 /root；预留 agent path 与昵称，产出最终的 `SessionSource::SubAgent(ThreadSpawn{...})` 与元数据。
-5. **建线程**：有 fork 模式走 `spawn_forked_thread`（5.8.4），否则 spawn_new_thread_with_source（全新空白历史）；两种都显式带上 ThreadSource::Subagent、父子环境/exec policy 继承、父 turn/root turn id。
-6. **提交与广播**：commit reservation 与 residency slot；发出 subagent session started 分析事件；notify_thread_created 通知客户端订阅新线程；非 ephemeral 线程把 spawn edge（Open 状态）持久化进 agent graph store——这是 V2 断线恢复整棵树的依据。
-7. **发送初始输入**：
-   - 用户输入型：send_input（start-or-steer）；
-   - 通信型：容量复查后经 Op::InterAgentCommunication 提交（V2 主路径，内容通常是带任务描述的 NEW_TASK）。
-
-随后非 V2 才启动 completion watcher（5.4.1），并返回 LiveAgent { thread_id, metadata, status }。handler 层再补两笔：emit 一条 SubAgentActivityKind::Started 的 TurnItem 供 UI 渲染；打点 codex.multi_agent.spawn{role, version} 计数器。
-
-### 5.8.4 Fork：历史继承的真实算法
-
-全量/截断 fork 比“复制粘贴对话记录”精细得多，都在 `spawn_forked_thread` 里：
-
-**第一步，物化父历史。** rollout 写入是异步排队的，fork 快照前必须 ensure_rollout_materialized + flush_rollout，否则会漏掉最近的 item。
-
-**第二步，按白名单筛选 items**（keep_forked_rollout_item）：
+**第二步，白名单筛选。** 不是所有历史条目都值得遗传：
 
 | 保留 | 丢弃 |
 |------|------|
-| system / developer / user 消息 | Reasoning、各类 tool call/output（除无 call_id 的孤儿输出） |
-| assistant 仅 FinalAnswer phase 的最终回答 | AgentMessage（内部流式消息一律不带过去） |
-| 没有 call_id 的 function 输出 | InterAgentCommunication 及其 metadata、SecurityRiskScore |
-| Compaction、SessionMeta、EventMsg | TurnContext / WorldState（仅全量 fork 保留，理由见下） |
+| 系统 / 开发者 / 用户消息 | 推理过程、工具调用与输出 |
+| assistant 的最终回答 | assistant 的中间流式消息 |
+| 上下文压缩记录、会话元数据 | Agent 间通信记录及其元数据、风险评分 |
+| 上下文基线（仅全量 fork） | 已被压缩检查点作废的旧基线 |
 
-TurnContext/WorldState 的取舍有个精妙处：全量 fork 复用父的“参考上下文基线”，避免子端重建上下文；但一旦遇到旧式的 compaction checkpoint（无 replacement_history），就必须放弃基线重建——因为 checkpoint 已经让基线过期了。
+上下文基线的取舍有个精妙处：全量 fork 复用父的上下文基线，子端不必从头重建；但如果父历史里存在旧式压缩检查点，基线已经过期，只能放弃重建。
 
-**第三步，开发指令层的净化与替换。** 逐条扫 developer 消息内容：
+**第三步，指令净化与替换。** 逐条扫描历史中的开发者指令，剔除多 Agent 角色说明、模式指令、usage hint 等“管理性段落”——这些是父 Agent 的身份说明，不应原样遗传，子端会重建属于自己的那份。如果配置了子 Agent 专用的 developer instructions，会把匹配父版本的片段替换成子版本；若父历史里恰好没写入这类片段，则补发一条，保证子 Agent 的专属指令恰好送达一次。
 
-- 剔除多 Agent 角色指令片段（MultiAgentRoleInstructions）、模式指令片段、时间提醒片段、usage hint 文本——这些“管理性段落”不应原样遗传给子 Agent，子端会重建属于自己的那份；
-- V2 下若配置了子 Agent 专用 developer instructions，则把与父 developer instructions 文本匹配的片段**替换**为子版本（文本包含匹配——rollout item 里 fragment 尚无独立溯源标记，源码留了 TODO 改进）；
-- 全量 fork 但父上下文本没写入 developer fragment 时，补一条 developer update item，确保子指令恰好送达一次。
+**第四步，截断与追加。** 只继承最近 N 轮时，先把历史截到 N 轮；全量 fork 则在末尾追加子 Agent 自己的 usage hint（5.9.2）。
 
-**第四步，截断与追加。** LastNTurns(n) 先把 rollout 截到最后 n 轮；分页历史模式下过滤 EventMsg 类噪音 items；最后在全量 fork 场景追加子 Agent 自己的 usage hint（来自 role catalog 或配置）。
+走完这四步，新线程带着筛选过的历史诞生，并记下“fork 自哪个线程、由哪次 spawn 调用产生”，供审计追溯。
 
-走完这套流程，`fork_thread_with_source` 以 InitialHistory::Forked(items) 建出新线程，并记下 forked_from_thread_id 与 fork_parent_spawn_call_id（审计用）。
+### 5.5.5 spawn 返回什么
 
-### 5.8.5 spawn 结果输出
-
-返回给模型的 JSON 由 `hide_spawn_agent_metadata` 控制（默认 true）：
+默认只返回规范路径，昵称都藏起来（可配置打开）：
 
 ```jsonc
-// 默认：只给规范 task 名
+// 默认
 { "task_name": "/root/task_3" }
-// hide_spawn_agent_metadata=false 时额外带昵称
+// 打开元数据输出后
 { "task_name": "/root/task_3", "nickname": "Kepler" }
 ```
 
-关闭元数据输出的动机之一是减少不必要的可见信息随响应扩散。
+动机是减少不必要的信息随响应扩散——模型干活只需要路径，昵称是给人类看的。
 
-## 5.9 Agent 间通信
+## 5.6 Agent 间通信：邮箱模型与等待
 
-### 5.9.1 协议消息
+### 5.6.1 消息信封
 
-Agent 间通信通过 `InterAgentCommunication` 实现（`codex-rs/protocol/src/protocol.rs`）：
+Agent 之间传递的每条消息是一个信封，装着：发件人路径、收件人路径（可抄送更多 Agent）、正文、以及一个关键开关——**要不要触发对方开始一轮工作**。正文默认明文渲染；当消息来自非明文通道时，正文改放加密字段，降低跨会话泄露面。
 
-```rust
-pub struct InterAgentCommunication {
-    pub id: Option<ResponseItemId>,
-    pub author: AgentPath,
-    pub recipient: AgentPath,
-    pub other_recipients: Vec<AgentPath>,
-    pub content: String,
-    pub encrypted_content: Option<String>,   // 非明文通道的内容走这里
-    pub trigger_turn: bool,
-}
+### 5.6.2 投递路径：统一进邮箱，调度器决定何时开工
+
+```mermaid
+sequenceDiagram
+    participant P as 父 Agent（turn 中）
+    participant C as 控制中心
+    participant M as 子 Agent 的邮箱
+    participant S as 子 Agent
+    P->>C: send_message / followup_task / spawn 初始任务
+    C->>C: 若需要触发工作，先检查执行并发名额
+    C->>M: 消息入队
+    alt 需要触发工作 且 子 Agent 空闲
+        M->>S: 调度器为它开一个新 turn
+    else 子 Agent 正在忙
+        M->>S: 消息留在邮箱，当前采样结束或工具调用完成后送达
+    end
+    S-->>M: 任务完成 → FINAL_ANSWER 投回父的邮箱（不触发父的 turn）
+    M-->>P: 父调 wait_agent 时被“邮箱有动静”叫醒
 ```
 
-工具层构造消息时有一步通道感知（communication_from_tool_message）：来源是 DirectPlaintextMessage 就渲染成人读的消息框架并以明文存放；否则改走 new_encrypted，正文装进 encrypted_content。
+关键语义：**所有投递统一进目标 Agent 的邮箱队列，不是“消息一到立刻开 turn”**。是否开工由一个共享的待处理工作调度器裁决——目标空闲且消息要求触发时才开新 turn；目标在忙，消息就在消息边界处择机送达，不打断正在进行的采样。这正是 V2 的 wait 能做成纯事件驱动的前提。
 
-### 5.9.2 投递路径
+### 5.6.3 三种消息 + 一张通知卡
 
-```
-父 Agent 调用 send_message / followup_task / spawn_agent
-    │
-    ▼
-handler 构造 InterAgentCommunication（含渲染或加密决策）
-    │
-    ▼
-AgentControl::send_inter_agent_communication
-    │  （trigger_turn=true 时先做执行容量检查）
-    ▼
-ThreadManagerState::send_op(Op::InterAgentCommunication)
-    │
-    ▼
-目标 Session 收到 Op → inter_agent_communication()   [session/handlers.rs]
-    │
-    ├─ enqueue_mailbox_communication：入邮箱队列
-    └─ trigger_turn || 存在 durable sleep 待处理
-          → maybe_start_turn_for_pending_work_with_sub_id
-            （交由 pending-work 调度器决定空闲会话何时开 turn）
-```
+子 Agent 与父 Agent 收到的通信被渲染成固定格式的上下文条目：
 
-注意这里的语义比“入队后立刻开 turn”更讲究：投递统一进邮箱队列，是否开新 turn 由共享的 pending-work 调度器裁决——这正是 V2 wait 工具能在事件驱动模型下工作的前提。
+| 类型 | 由什么产生 | 触发对方工作？ |
+|------|-----------|----------------|
+| MESSAGE | `send_message` | 否 |
+| NEW_TASK | `followup_task`、spawn 的初始任务 | 是 |
+| FINAL_ANSWER | 子 Agent 结束时由完成观察者自动回投 | 否（入队等父取阅） |
 
-### 5.9.3 三种语境化消息 + 一张通知卡
+另外 V1 的通知路径不用邮箱消息，而是往父上下文写一张 `<subagent_notification>` 状态卡片（内含 Agent 路径和状态）。
 
-子 Agent 与父 Agent 收到的通信内容是四类固定渲染（实现都在 core/src/context/，均为 ContextualUserFragment）：
+### 5.6.4 wait_agent：只负责“叫醒”，不搬运内容
 
-| Fragment | 角色 | 标记 | 形态 |
-|----------|------|------|------|
-| InterAgentMessage (Message/NewTask) | assistant | 无 | Message Type: MESSAGE\|NEW_TASK + Task name + Sender + Payload |
-| InterAgentCompletionMessage | assistant | 无 | 同上，Message Type 为 FINAL_ANSWER |
-| SubagentNotification | user | <subagent_notification></subagent_notification> | JSON {"agent_path", "status"} |
+父 Agent 想等子 Agent 的进展时调用 `wait_agent`。它等待的不是某个具体子 Agent，而是**自己收件方向的任何动静**，只有两类事件能叫醒它：
 
-MESSAGE 由 send_message 产生（不触发 turn）；NEW_TASK 由 followup_task 与 spawn 的初始任务产生（触发 turn）；FINAL_ANSWER 是子 Agent 结束时 completion watcher 生成的结果回包（不触发 turn，入队等待父 Agent 取阅）。SubagentNotification 只服务非 V2 通知路径。
+1. **邮箱来新东西了**——某个子 Agent 发来了消息，或有子 Agent 的完成通知到达；
+2. **用户插话了**——用户往父 Agent 正在进行的这个 turn 里 steer 了新输入，等待应立即让位。
 
-### 5.9.4 等待结果：wait_agent 的三种结局
+结局对应三句返回文案：“Wait completed.”（邮箱有动静）/ “Wait interrupted by new input.”（被用户输入打断）/ “Wait timed out.”（超时），外加一个 `timed_out` 布尔位。注意 **wait 不返回消息内容本体**——它只报告“有动静了”，具体内容会随下一轮模型采样以正常消息形式进入上下文。职责单一：wait 是唤醒原语，不是取件接口。
 
-父 Agent 通常在自己的 turn 里调 wait_agent 等 mailbox 动静（V2 版本，multi_agents_v2/wait.rs）：
+超时参数的处理也很克制：超过上限（默认 1 小时）直接报错给模型；低于下限（默认 10 秒）不报错，而是**钳制到下限**并在返回里注明被钳制了；不填默认 30 秒。下限存在的意义是防止模型忙轮询。等待期间系统还会向 UI 发出一对“等待开始/结束”的条目，界面因此能画出父 Agent 的等待时段。
 
-- 监听的是本 session input queue 的 InputQueueActivity watch 流，活动分两类：Mailbox（有子 Agent 消息/完成通知到达）与 Steer（用户把新输入 steer 进了当前 turn）；
-- **timeout_ms 校验**：超过 max 直接报错给模型；低于 min 则**钳制到最小值**并在输出里注明 clamp；缺省 30s；
-- 三种结局对应三句输出文案："Wait completed." / "Wait interrupted by new input." / "Wait timed out."，外加 timed_out 布尔位；**不返回内容本体**——内容会随后续采样进入上下文，wait 只负责“叫醒”；
-- 等待期间 emit 成对的 CollabAgentToolCall(tool=Wait, InProgress/Completed) TurnItem，UI 能画出等待时段。
+V1 的 wait 是另一种形状：调用方点名一批目标 Agent 和超时，谁先进入终态就先返回，结果是一张“Agent → 最终状态”的字典。V2 把“等谁”交给邮箱事件、把“是谁来了”推迟到消息本身——更适合不确定有多少个子 Agent 会回报的并行协作。
 
-V1 的 wait 是另一番形状：传 targets（多个 id 竞争，谁先终态谁先返回）+ timeout，返回「id → 最终状态」字典与 timed_out。V2 把“选谁”交给 mailbox 事件，把“是谁来了”推迟到后续消息本身，更适合不确定个数的并行协作。
+### 5.6.5 其他管理动作
 
-### 5.9.5 其他管理动作
+- **`send_message`**：轻量投递，永不触发对方开工；
+- **`followup_task`**：追加任务——对方空闲就开新 turn，忙碌则在消息边界处送达，插入而不打断；
+- **`interrupt_agent`**（V2）：只打断对方当前的 turn，Agent 本体仍存活、可继续收消息。对照 V1 的 `close_agent`：连同存活后代一起关停，而且已进入 Completed 状态的 Agent 如果不显式 close，会一直占着并发名额——V1 的工具描述因此明确提醒模型“用完及时释放”；
+- **`resume_agent`**（V1）：把已关闭的 Agent 恢复到可再次接收输入的状态；持久化层面的恢复会沿着持久化的父子边广度优先遍历，把整棵后代树一起恢复。
 
-- **send_message**：轻量投递，永不触发 turn；
-- **followup_task**：空闲则开 turn，忙碌则“sampling 过程中的消息边界处或 pending tool call 完成后尽快送达”——插入而不打断完整性；
-- **interrupt_agent**（V2）：中断当前 turn 并返回 previous_status；Agent 本体仍存活可继续收消息。对照 V1 的 close_agent：连带活体后代一起关停，且先前是 Completed 的 Agent 若不显式 close 会一直计入并发额度（工具描述里明确提醒模型及时释放不需要的 Agent）；
-- **resume_agent**（V1）：把此前 closed 的 Agent 恢复到可再次接收输入的状态；持久化层面的恢复由 `resume_agent_from_rollout` 完成——沿持久化的 spawn 边 BFS 恢复整棵后代树。
+## 5.7 V1 与 V2：两套协议差在哪
 
-## 5.10 V1 与 V2 多 Agent 模式
+Codex 同时实现了两代多 Agent 工具集，差异远不止“工具名换了”。
 
-Codex 实现了两套多 Agent 工具集，差异不止“工具名好不好看”。
-
-### 5.10.1 总览对比
+### 5.7.1 总览对比
 
 | 维度 | V1 | V2 |
 |------|----|----|
-| 工具命名 | namespace `multi_agent_v1`（常量 MULTI_AGENT_V1_NAMESPACE）下的 spawn_agent/send_input/wait_agent/resume_agent/close_agent | 扁平函数名 spawn_agent/send_message/followup_task/wait_agent/interrupt_agent/list_agents，默认配在 collaboration 命名空间（`to=functions.collaboration.*`） |
-| 实现目录 | tools/handlers/multi_agents/{spawn,send_input,wait,resume_agent,close_agent}.rs | tools/handlers/multi_agents_v2/{spawn,send_message,followup_task,wait,interrupt_agent,list_agents,message_tool}.rs |
-| 寻址 | ThreadId 字符串为主 | Task path（相对或规范全名）或 ThreadId |
-| 初始/追加任务 | send_input(interrupt=bool) 一个入口双语义 | followup_task（触发 turn）/ send_message（不触发）分开 |
-| 结束方式 | close_agent（关停子孙树） | interrupt_agent（仅断当前 turn，Agent 留守）；生命周期交给 residency |
-| 历史 fork | fork_context: bool | fork_turns: none/all/N |
-| 历史净化 | 较简单 | 开发指令片段剔除/替换、usage hint 重建、compaction 基线处理（5.8.4） |
-| 输出 | submission_id / 状态字典 | canonical task name（默认隐藏昵称） |
-| 结果回流 | 状态卡片 <subagent_notification> | FINAL_ANSWER 通信 + 邮箱调度 |
-| 并发控制 | 名额总数限制 | AgentExecutionLimiter + residency LRU 驻留 |
-| 教学材料 | 工具描述内嵌大段委派指南（何时委派/何时不委派/怎么拆子任务） | root/subagent 双份 usage hint + 模式指令 |
+| 工具集 | 独立命名空间下的 spawn / send_input / wait / resume / close 五件套 | 扁平的 spawn_agent / send_message / followup_task / wait_agent / interrupt_agent / list_agents |
+| 寻址 | 线程 id 字符串为主 | 任务路径（短名或全路径）或线程 id |
+| 初始/追加任务 | send_input 一个入口、双语义（靠 interrupt 标志区分） | followup_task（触发工作）与 send_message（不触发）分开 |
+| 结束方式 | close_agent 关停整棵子孙树 | interrupt_agent 只断当前 turn；生命周期交给驻留机制 |
+| 历史继承 | fork_context 布尔：全量或不继承 | fork_turns：不继承 / 全量 / 最近 N 轮 |
+| 历史净化 | 较简单 | 指令片段剔除与替换、usage hint 重建、压缩基线处理（5.5.4） |
+| spawn 输出 | 不透明的提交 id | 规范任务路径（默认隐藏昵称） |
+| 结果回流 | `<subagent_notification>` 状态卡片 | FINAL_ANSWER 邮箱消息 + 调度 |
+| 并发控制 | 总量上限 | 执行并发限制 + LRU 驻留换出 |
+| 教学材料 | 工具描述内嵌大段委派指南 | root/subagent 双份 usage hint + 模式指令 |
 
-V1 特有一件小工具容易漏看：resume_agent 可以把此前 closed 的 Agent 恢复到可再次接收输入的状态；持久化恢复则由 resume_agent_from_rollout 完成——沿 spawn 边 BFS 恢复整棵后代树。
+一句话概括：**V1 管的是“会话内的工作小组”，V2 管的是“可持久化、可驱逐、可恢复的常驻团队”。**
 
-### 5.10.2 版本选择的完整判定
+### 5.7.2 运行时选哪套
 
-工具可用性（spec_plan.rs 的 collab_tools_enabled）：
+版本裁定遵循固定优先级：**显式配置 > 模型目录声明 > 功能开关默认值**。
 
-- Disabled → 不可用；
-- V1 → 当前深度没超限；
-- V2 → 当前 session 没有已被赋值的 agent path（即是发起方），**或者**模型自身声明支持 multi-agent V2（model_info.multi_agent_version == Some(V2)）。深嵌套的孙子代想再 spawn，要靠模型能力位背书——比 V1 单纯的 depth gate 更注重“这一层的模型是否见过协作语义”。
+工具是否暴露给模型，两道版本还有各自的闸门：
 
-最终版本裁定 effective_multi_agent_version_for_spawn（以及同族 multi_agent_version_for_model）的优先序：**显式配置覆盖 > 模型目录声明 > feature flag 默认值**。
+- V1：当前嵌套深度没超限即可（见 5.8）；
+- V2：当前会话要么自己就是发起方（树上还没人给它指派过路径），要么**所用模型在目录里声明支持多 Agent V2**。深嵌套的孙代想继续派生，得靠模型能力位背书——比起 V1 单纯的深度硬卡，V2 更看重“这一层的模型是否理解协作语义”。
 
-## 5.11 并发、深度与预算控制
+## 5.8 资源控制：四层闸门
 
-### 5.11.1 配置矩阵（默认值均在 core/src/config/mod.rs）
+### 5.8.1 配置一览
 
 | 配置 | 默认值 | 含义 |
 |------|--------|------|
-| DEFAULT_AGENT_MAX_THREADS | Some(6) | V1 每 session 子线程总量上限 |
-| DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION | 4 | V2 每 session 并发线程上限；effective 计算为 -1（root 自身占一个名额，3 个真子代理） |
-| DEFAULT_AGENT_MAX_DEPTH | 1 | 最大 spawn 深度（主要是 V1 的强闸门，见下） |
-| min_wait_timeout_ms | 10_000 | wait_agent 最小等待（防忙轮询） |
-| default_wait_timeout_ms | 30_000 | wait_agent 默认等待 |
-| max_wait_timeout_ms（= HARD_MAX…TIMEOUT_MS） | 3_600_000 | wait_agent 上限（1 小时） |
-| hide_spawn_agent_metadata | true | spawn 结果默认不给昵称 |
+| 子线程总量上限（V1） | 6 | 一棵树里最多同时登记多少个子线程 |
+| 执行并发上限（V2） | 4 | 一棵树里最多同时“在干活”的线程数；根自己占一个名额，实际留给子 Agent 3 个 |
+| 最大派生深度 | 1 | 默认只有根能 spawn 一层，显式调高才能继续嵌套 |
+| wait 最小 / 默认 / 最大超时 | 10s / 30s / 1h | 防忙轮询与无限等待 |
+| spawn 结果隐藏昵称 | 开 | 默认只返回路径 |
 
-usage hint 还会把并发容量**念给模型听**："There are {max_concurrency} available concurrency slots…"，让模型对并行度形成预期。
+usage hint 还会把并发容量直接念给模型听（“还有 N 个并发槽可用”），让模型对并行度形成正确预期，而不是撞了限制才知道。
 
-### 5.11.2 并发限制：AgentExecutionLimiter
+### 5.8.2 执行并发：限“正在干活的”，不限“活着的”
 
-codex-rs/core/src/agent/control/execution.rs：
+V2 的并发限制针对的是**同时处于执行中（在跑 turn）的 Agent 数**，而不是存活 Agent 数——已完成或空闲等待的 Agent 不占名额。检查发生在两个时刻：spawn 新 Agent 时，以及一条“要触发工作”的消息投递前（如果对方已经在跑 turn，直接放行，不需要新名额）。拿到名额后开始干活，干完自动归还——中间出错也保证归还，不会泄漏。
 
-```rust
-pub(super) struct AgentExecutionLimiter {
-    active: AtomicUsize,
-    max_threads: OnceLock<usize>,   // with_session_id 时一次性初始化
-}
-```
+### 5.8.3 深度与预算
 
-- 检查发生在两个时刻：spawn 前；以及 V2 触发型通信交付前（ensure_execution_capacity_for_turn_start——目标已在跑的 turn 则直接放行，不需要新容量）；
-- 通过检查后取得 AgentExecutionGuard，RAII 式 Drop 减计数；
-- 只对 “V2 + SubAgent source” 组合生效（is_execution_limited）。
+深度默认卡死在 1（只有根能派生），对 V1 是双重闸门：决定要不要把 spawn 工具暴露给模型时查一次，真正执行时再查一次。V2 则用模型能力位部分替代了深度硬卡（5.7.2），但物理上限仍在，防止无限递归派生。
 
-与注册表的总量上限不同，limiter 限的是**同时在执行 turn 的 agent 数**，完成/idle 的不计入。
+token 预算则是整棵树共享一份：根与所有子 Agent 指向同一个预算实例，包含总量上限、提醒阈值和采样权重，任何节点都不会偷偷超支。
 
-### 5.11.3 RolloutBudget 与深度
+### 5.8.4 V2 驻留：像内存换页一样管理 Agent
 
-AgentControl 持有共享的 Arc<RolloutBudget>：整个树共用一份 token 预算配置（limit_tokens + 提醒阈值 + 采样/预填充权重），根与所有克隆句柄指向同一实例。
+V2 子 Agent 的存活语义类似操作系统的内存换页——**“关机”不等于“除名”**：
 
-深度控制对 V1 是双重闸门（注册与执行都查）；V2 如 5.10.2 所述以模型能力位替代了无条件深度上限。原有的物理上限依然存在：超出后新 spawn 报错，防止无限递归。
+- 每个 V2 子 Agent 都是“驻留候选”，系统维护一条按最近使用排序的驻留队列；
+- 新 spawn 需要驻留名额；名额满了，就从最久未用的一端找驱逐对象。可被驱逐的条件很严格：处于终态附近（Completed/Errored/Interrupted）、没有正在跑的 turn、邮箱已清空。满足条件才被关停、历史落盘、移出内存；找了一圈没有合格对象，才把名额还回去并报“名额已满”；
+- 被驱逐者的环境选择等运行期资产存进注册表。之后如果有人给它发了后续任务，系统会从持久化存储读回它的元数据和模型上下文、重放角色（5.4.2）、恢复模型设置，把它重新载入内存并标记为最近使用；
+- “此刻在不在内存里”（驻留状态）与“树关系还在不在”（持久化的父子边）是两套独立状态——这就是 V2 “常驻团队”的含义：Agent 可以被换出内存，但随时能被召回，树的结构不因驱逐而丢失。
 
-### 5.11.4 V2 Residency：常驻代理的 LRU 驻留
+## 5.9 把协作教给模型：工具描述与 usage hints
 
-V2 子 Agent 的存活语义由 V2Residency（control/residency.rs）管理，思路类似内存换页：
+多 Agent 能力最终是通过工具暴露给模型的，但暴露的不只是工具 schema，还有一整套嵌在上下文里的提示词工程——机制负责“挡住失控”，提示词负责“引导别乱来”。
 
-- 所有 SessionSource::SubAgent(_) 的 V2 线程都是 resident candidate；residency 维护一个 LRU VecDeque<ThreadId>；
-- 新 spawn 要拿 pending slot；满了就从 LRU 头部找驱逐候选：必须是“终态附近”（Completed/Errored/Interrupted）、无活动 turn、mailbox 空——满足才 shutdown_and_wait + 物化 rollout + 移出线程表；中途被 touch（复活）过的候选跳过。找不到可驱逐者时归还 slot 并报 AgentLimitReached；
-- 被驱逐者的环境选择存在注册表里（save_evicted_environments）；后续 ensure_v2_agent_loaded（比如有人给它发了 followup）会从 thread-store 读回元数据与模型上下文，重放角色（5.7.3）、恢复 stored model/provider，重建线程并 touch LRU；
-- spawn edge 状态机（Open/Closed，agent graph store）与 residency 相互独立：residency 决定“此刻在不在内存里”，edge 决定“树关系还在不在”。这就是 V2 的“常驻”——Agent 关机不等于除名。
+### 5.9.1 工具描述里的委派纪律
 
-## 5.12 把 Multi-Agent 教给模型：工具描述与 usage hints
+V1 的 spawn 工具描述本身就是一篇委派方法论，要点包括：
 
-Multi-Agent 能力最终通过工具暴露给模型。在 spec_plan.rs 的 add_collaboration_tools 中按版本注册对应工具集。但暴露的不止 tool spec，还有一整套嵌入上下文的提示词工程。
+- **授权门槛**：除非用户或 AGENTS.md/skill 明确要求委派或并行，否则不许 spawn；“研究得深入一点”这类话不算授权；
+- **先计划再委派**：识别关键路径上的阻塞点和可并行的支线任务；阻塞点必须自己做，不能丢给子 Agent 然后干等；
+- **子任务设计**：具体、自包含、实质推进主任务；编码类任务尽量委派“能落盘修改、最后列出改动文件”的 worker，而不是只读探险；多个子任务的写集必须不相交；
+- **委派之后**：wait 要省着用（只在关键路径真被阻塞时）；等待期间立刻去做不重叠的正事，禁止反射性地反复 wait。
 
-### 5.12.1 工具描述里的委派纪律
+这些软性纪律与 5.8 的硬性限流互为表里：机制挡住“想并行也并行不了太多”，描述词引导“不该并行的别并行”。
 
-V1 spawn_agent 的 description 本身就是一篇委派方法论（节选要点）：
+### 5.9.2 双视角 usage hints
 
-- **授权门槛**：除非用户或 AGENTS.md/skill 明确要求委派/并行，不许 spawn；“研究得深入一点”“仔细分析”这类请求不算授权；
-- **先计划再委派**：识别关键路径 blocker 与可并行的 sidecar 任务；blocker 必须本地自己做，别丢给子模型再干等；
-- **子任务设计**：具体、自包含、实质推进主任务；编码类尽量委派“可落盘修改 + 最后列出改动文件”的 worker 任务而非只读探险；多个子任务的写集必须不相交；
-- **委派之后**：wait_agent 要省着用（只在关键路径真被阻塞时调用）；等待期间立刻去做不重叠的正事，禁止反射性反复 wait。
+V2 按身份注入不同的提示文本（可被配置或模型目录覆盖，设为空串则彻底关闭）：
 
-这些规则与 5.11 的硬限流互为表里：机制挡住“不得不并行太多”，描述词引导“不该并行别并行”。
+- **root 版**：告诉它“你是 /root，所有 Agent 同等智能、拥有同样的工具，你可以 spawn / 追加任务 / 发消息”，并列出它会收到的两种消息格式（MESSAGE、FINAL_ANSWER）；
+- **subagent 版**：多教一条 NEW_TASK 进件格式，并说明“你在 final 频道的回复会立即送回父 Agent”——这就是结果回传机制的说明书；
+- **公共部分**：协作工具必须作为独立工具调用（不能包在 exec 里间接调）；所有 Agent 共享目录和文件系统、编辑互相立即可见；当前还剩几个并发槽；等待建议用分钟级，避免忙轮询。
 
-### 5.12.2 双视角 usage hints
+### 5.9.3 模式指令：多 Agent 的总开关
 
-V2 会根据身份注入不同的 hint（session/multi_agents.rs，可被配置 root_agent_usage_hint_text / subagent_usage_hint_text / model catalog 覆盖，空字符串表示彻底抑制）：
+还有一层总开关式的开发者指令，三种模式：
 
-- **root 版**：“你是 /root……所有 Agent 同等智能、拥有同样的工具……你可以用 spawn_agent / followup_task / send_message……你将收到如下格式的消息”；它列出了 MESSAGE/FINAL_ANSWER 两种收件格式；
-- **subagent 版**：多一条 NEW_TASK 进件格式，并教它“final channel 的回复会立即送回父 Agent”——这就是结果回传机制的说明文本；
-- **公共尾巴**：协作工具不能从 functions.exec 内部调用，必须作为直接工具调用（to=functions.collaboration.*）；所有 Agent 共享目录/文件系统，编辑互相立即可见；并发槽数量宣示；wait 建议（分钟级等待避免忙轮询）。
+| 模式 | 效果 |
+|------|------|
+| ExplicitRequestOnly（默认） | 覆盖一切更早的主动性指示：“除非被明确要求，否则不要派生子 Agent” |
+| Proactive | 反转上述限制，允许主动委派，直到下一条模式指令改变它 |
+| Custom | 使用配置或模型目录提供的自定义全文 |
 
-hints 选择器（usage_hint_text）按 session source 分发：ThreadSpawn 子代理拿 subagent 版，Cli/VSCode/Exec/Mcp 等源头拿 root 版；Internal 等特殊来源不给。
+模式的自动判定颇有意思：**推理档位拉到最高档（Ultra）时自动升级为 Proactive**；配置了自定义文本则进入 Custom；否则保持默认。“推理强度越高，越信任它的自主委派判断”——这是一条刻在机制里的启发式。
 
-### 5.12.3 模式指令：<multi_agent_mode>
-
-还有一层总开关式的 developer message（context/multi_agent_mode_instructions.rs）：
-
-| 模式 | 注入文本的效果 |
-|------|----------------|
-| ExplicitRequestOnly（默认） | 覆盖一切更早的主动性指示：“Do not spawn sub-agents unless explicitly asked…” |
-| Proactive | 反转上述限制：主动委派生效，直到下一条 mode 消息改变它 |
-| Custom(text) | 配置/model catalog 的自定义全文 |
-
-模式的判定（effective_multi_agent_mode）颇有意思：reasoning effort 达到 **Ultra** 自动升级为 Proactive；配置了 hint 文本（含空串）则成为 Custom；否则 ExplicitRequestOnly。“推理强度越高越信任其自主委派判断”是一条刻在机制里的启发式。
-
-## 5.13 设计取舍
+## 5.10 设计取舍
 
 | 取舍 | 选择 | 替代方案 | 原因 |
 |------|------|----------|------|
-| Agent = Thread | 复用 Session/CodexThread | 独立进程 | 复用基础设施，统一持久化/沙箱 |
-| 共享 AgentControl | 同 session 树共享一份 | 每个 Agent 独立控制 | 统一 budget、并发、注册表；作用域天然收敛在树内 |
-| Weak 引用 manager | 避免循环引用 | Arc 强引用 | 防止内存泄漏和影子持久化 |
-| AgentPath 硬校验、禁 .. | 只许向下相对引用 | 任意相对寻址 | 保证树形结构，杜绝引用逃逸导致的归属混乱 |
-| SpawnReservation 两阶段预留 | Drop 自动回滚 | 直接写入再补偿删除 | spawn 中途失败零残留 |
-| 昵称池 + 序号轮次 | 101 科学家名可耗尽重来 | 每个 agent 随机哈希名 | 展示友好且有限可枚举，冲突靠轮次消解 |
-| fork 白名单 + 净化 | 只带有用项、管理片段重建 | 整卷复制 | 防 instruction 遗毒、控上下文体积 |
-| 通信默认加密通道 | 非 DirectPlaintext 走 encrypted_content | 全部明文 | 降低跨会话泄露面 |
-| V2 用能力位替代纯深度限制 | 模型声明支持才暴露 spawn | 一律按 depth 硬卡 | 协作质量依赖模型对协语的熟悉度 |
-| Residency LRU 驻留 | 完成即可被换出 | spawn 即常驻直到 close | 内存可控又不失“可回访性” |
-| wait 只报告不动内容 | mailbox watch + summary | wait 返回全部积压内容 | 内容按正常采样渠道进场，职责单一 |
-| V1 + V2 并存 | 两套工具集 | 只保留一套 | 平滑演进，兼容旧配置 |
-| 执行容量限制只对 V2 | V2 限并发 | 所有版本都限 | V2 面向大规模协作，更需要挡失控 |
-| 角色是白名单叠加层 | 只能收窄不能扩权 | 自由 config 改写 | 保住父会话权威，权限不逃逸 |
+| Agent 的表示 | 复用普通对话线程 | 独立进程/独立运行时 | 基础设施零新增，持久化与沙箱天然统一 |
+| 控制中心作用域 | 每棵 root 树一份 | 全局一份 | 预算与名额的作用域天然收敛在树内，树间互不干扰 |
+| 寻址 | 树形路径 + 硬校验，禁 `..` | 任意相对引用 | 引用关系钉死成树，归属与回收语义清晰 |
+| spawn 注册 | 两阶段预留 + 失败自动回滚 | 先写再补偿删除 | 中途失败零残留、不泄漏名额 |
+| 历史继承 | 白名单筛选 + 指令净化 | 整卷复制 | 防止父的“管理性指令”遗毒子 Agent，控制上下文体积 |
+| 结果回流 | 完成观察者自动投递 | 父轮询子状态 | 父不用关心子的死活，事件驱动 |
+| wait 语义 | 只报告“有动静”，不带内容 | wait 返回全部积压消息 | 内容走正常采样通道进场，唤醒与取件职责分离 |
+| 生命周期 | V2 驻留换出、可召回 | spawn 即常驻直到显式关闭 | 内存可控，又不失“可回访性” |
+| 版本策略 | V1/V2 并存 | 只保留一套 | 平滑演进，兼容旧配置 |
 
-## 5.14 关键实现入口
+## 5.11 关键实现入口
 
 | 概念 | 主要文件 | 说明 |
 |------|----------|------|
-| AgentControl | codex-rs/core/src/agent/control.rs | 多 Agent 控制面、通信投递、list/interrupt/status、completion watcher |
-| Agent spawn | codex-rs/core/src/agent/control/spawn.rs | spawn_agent_internal、fork 算法、residency 恢复、V1 树状 resume |
-| Spawn 共享辅助 | codex-rs/core/src/tools/handlers/multi_agents_common.rs | 子配置构建、模型/tier/role 校验、错误翻译 |
-| V1 handlers | codex-rs/core/src/tools/handlers/multi_agents/{spawn,send_input,wait,resume_agent,close_agent}.rs | V1 五件套 |
-| V2 handlers | codex-rs/core/src/tools/handlers/multi_agents_v2/{spawn,send_message,followup_task,wait,interrupt_agent,list_agents,message_tool}.rs | V2 六件套 + 消息内容处理 |
-| 工具规格/schema | codex-rs/core/src/tools/handlers/multi_agents_spec.rs | 全部参数/输出 schema、委派指南描述文 |
-| 关闭与关停 | codex-rs/core/src/agent/control/legacy.rs | shutdown/close/tree-level close |
-| Agent 执行限制 | codex-rs/core/src/agent/control/execution.rs | AgentExecutionLimiter / Guard |
-| V2 Residency | codex-rs/core/src/agent/control/residency.rs | LRU 常驻管理 |
-| AgentRegistry | codex-rs/core/src/agent/registry.rs | 树索引、昵称池、SpawnReservation |
-| AgentPath | codex-rs/protocol/src/agent_path.rs | 路径校验/解析 |
-| AgentStatus | codex-rs/protocol/src/protocol.rs | 状态枚举与 InterAgentCommunication |
-| 状态推导 | codex-rs/core/src/agent/status.rs | agent_status_from_event / is_final |
-| Agent 角色 | codex-rs/core/src/agent/role.rs | apply_role_to_config、内置角色加载 |
-| 角色配置定义 | codex-rs/core/src/config/agent_roles.rs | [agent_roles] 解析 |
-| 通信 context fragments | codex-rs/core/src/context/{inter_agent_message,inter_agent_completion_message,subagent_notification}.rs | 四类注入内容的渲染 |
-| 模式指令 | codex-rs/core/src/context/multi_agent_mode_instructions.rs | ExplicitRequestOnly/Proactive/Custom |
-| usage hints | codex-rs/core/src/session/multi_agents.rs | root/subagent 双视角 hint 与解析 |
-| 通信日志 | codex-rs/core/src/agent_communication.rs | 发送/接收事件与通信 Kind |
-| Session 收信 | codex-rs/core/src/session/handlers.rs | inter_agent_communication 邮箱入队与调度 |
-| 工具注册开关 | codex-rs/core/src/tools/spec_plan.rs | add_collaboration_tools / collab_tools_enabled |
-| 配置默认值 | codex-rs/core/src/config/mod.rs | 并发/深度/wait 超时常量与 MultiAgentV2Config |
+| 控制中心 AgentControl | codex-rs/core/src/agent/control.rs | 注册、投递、状态订阅、完成观察者 |
+| Spawn 落地与 fork | codex-rs/core/src/agent/control/spawn.rs | spawn 主流程、fork 算法、驻留重载、V1 树状恢复 |
+| Spawn 共享辅助 | codex-rs/core/src/tools/handlers/multi_agents_common.rs | 子配置构建、模型/档位/角色校验 |
+| V1 工具 handlers | codex-rs/core/src/tools/handlers/multi_agents/ | spawn / send_input / wait / resume / close |
+| V2 工具 handlers | codex-rs/core/src/tools/handlers/multi_agents_v2/ | spawn / send_message / followup_task / wait / interrupt / list |
+| 工具 schema 与描述文 | codex-rs/core/src/tools/handlers/multi_agents_spec.rs | 参数/输出 schema、委派指南 |
+| 关停 | codex-rs/core/src/agent/control/legacy.rs | shutdown / close / 树级关停 |
+| 执行并发限制 | codex-rs/core/src/agent/control/execution.rs | V2 执行名额管理 |
+| V2 驻留 | codex-rs/core/src/agent/control/residency.rs | LRU 驻留与驱逐 |
+| 注册表 | codex-rs/core/src/agent/registry.rs | 双索引、昵称池、两阶段预留 |
+| 路径 | codex-rs/protocol/src/agent_path.rs | 路径校验与解析 |
+| 协议类型 | codex-rs/protocol/src/protocol.rs | Agent 状态枚举、消息信封 |
+| 状态推导 | codex-rs/core/src/agent/status.rs | 事件 → 状态映射、终态判定 |
+| 角色 | codex-rs/core/src/agent/role.rs | 角色加载与受限叠加 |
+| 角色配置 | codex-rs/core/src/config/agent_roles.rs | `[agent_roles]` 解析 |
+| 消息渲染 | codex-rs/core/src/context/ | MESSAGE / FINAL_ANSWER / 通知卡的上下文渲染 |
+| 模式指令 | codex-rs/core/src/context/multi_agent_mode_instructions.rs | 三种委派模式 |
+| usage hints | codex-rs/core/src/session/multi_agents.rs | root/subagent 双视角提示文本 |
+| 会话收信 | codex-rs/core/src/session/handlers.rs | 邮箱入队与开工调度 |
+| 工具注册开关 | codex-rs/core/src/tools/spec_plan.rs | 按版本与深度决定暴露哪些协作工具 |
+| 配置默认值 | codex-rs/core/src/config/mod.rs | 并发/深度/超时等常量 |
 | 昵称池 | codex-rs/core/src/agent/agent_names.txt | 101 个科学家名 |
 
-## 5.15 小结
+## 5.12 小结
 
-Codex CLI 的 Multi-Agent 系统建立在“**Agent ≈ Thread**”的简洁抽象之上，围绕一棵 root 树展开：
+Codex 的多 Agent 系统建立在一个极简抽象上：**子 Agent 就是一条普通对话线程**，跑和主会话完全相同的循环。围绕这个抽象：
 
-- AgentControl 是同树共享的控制面；AgentRegistry 双索引维护树状态，两阶段 SpawnReservation 保证 spawn 的原子性；
-- AgentPath 用类文件系统路径寻址，且硬校验禁掉 ..，把引用关系钉死成树；
-- Spawn 是一次完整的配置工程：turn 生效态出发 → 可选模型/tier/角色叠加 → 运行期状态强制同步 → 白名单 fork（伴随开发指令净化与替换）→ 注册与持久化 spawn 边；
-- 通信走统一邮箱：MESSAGE/NEW_TASK/FINAL_ANSWER 三种语境化消息 + 非 V2 的 <subagent_notification> 卡片；wait_agent 是事件驱动的唤醒原语，只报告活动不搬运内容；
-- 并发三层防护：注册表总数（V1 默认 6）、执行 limiter（RAII guard，V2 默认并发 4 − 树根 1）、深度闸门（V1 默认 1）；V2 再加一层 residency LRU，让完成的 Agent 可被换出、可被召回；
-- 角色是“只会削权”的配置叠加层；nickname 池耗尽靠序号轮次；工具描述与 usage hints 组成的提示词工程把委派纪律、消息格式、并发容量一并教给模型；
-- V1 与 V2 从命名空间到生命周期语义全面分化：V1 管“会话内的工作小组”，V2 管“可持久化、可驱逐、可恢复的常驻团队”。
+- 一棵树共享一份控制中心与注册表，两阶段预留保证 spawn 原子性，弱引用与自愈清理保证死 Agent 不占资源；
+- 树形路径寻址禁掉向上逃逸，把归属关系钉死成树；
+- Spawn 是一次完整的配置工程：从父的当前生效状态出发，强制同步审批与权限等“活状态”，再叠加经过校验的模型/角色覆盖，历史继承走白名单筛选加指令净化；
+- 通信是邮箱模型：投递统一入队、调度器决定何时开工；完成通知由观察者自动回投；wait 只负责唤醒、不搬运内容；
+- 资源有四层闸门：总量上限、执行并发上限（限“在干活的”）、深度闸门、以及 V2 的 LRU 驻留换出——Agent 可以被换出内存但永远可被召回；
+- 角色只能削权不能扩权；委派纪律、消息格式、并发余量则通过工具描述与 usage hints 直接教给模型。
 
-这套设计的总效果是：核心 Agent Loop 几乎不需要感知 Multi-Agent 的存在——树上的每个节点都在跑同一套循环，协作只是多了几种发消息和等结果的工具。
+这套设计的总效果是：**核心 Agent Loop 几乎不需要感知多 Agent 的存在**——树上每个节点跑同一套循环，协作只是多了几种发消息和等结果的工具。
 
-下一章（执行沙箱与权限）会深入讨论 Agent 执行命令和文件操作时的安全隔离机制。
+下一章（工具系统与扩展点）会深入工具路由、Extensions / MCP / Skills 如何把新能力注册进这套循环。

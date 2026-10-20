@@ -12,8 +12,12 @@
 agents-under-the-hood/
 ├── how-codex-works/            # Codex —— Agent 核心原理拆解
 ├── how-codex-security-works/   # Codex 安全机制拆解
+├── how-cue-works/              # Cue（Manus 桌面端）—— 闭源 Electron 应用逆向拆解
 ├── how-deepseek-harness-works/ # DeepSeek Harness —— Agent 拆解
-└── how-kimi-code-works/        # Kimi Code —— Agent 实现拆解
+├── how-kimi-code-works/        # Kimi Code —— Agent 实现拆解
+├── how-minimax-code-works/     # MiniMax Code —— Agent 实现拆解
+├── how-mu-works/               # mu —— 判断内核与 Jev 判定模型拆解
+└── how-zcode-works/            # ZCode —— AI 编程工作台拆解
 ```
 
 ---

@@ -12,8 +12,11 @@ Each subdirectory corresponds to a dissected Agent project — diving into the s
 agents-under-the-hood/
 ├── how-codex-works/            # Codex —— Agent core
 ├── how-codex-security-works/   # Codex security
+├── how-cue-works/              # Cue (Manus desktop) —— closed-source Electron app reverse engineering
 ├── how-deepseek-harness-works/ # DeepSeek Harness —— Agent dissection
-└── how-kimi-code-works/        # Kimi Code —— Agent implementation
+├── how-kimi-code-works/        # Kimi Code —— Agent implementation
+├── how-minimax-code-works/     # MiniMax Code —— Agent implementation
+└── how-zcode-works/            # ZCode —— Agent workbench dissection
 ```
 
 ---

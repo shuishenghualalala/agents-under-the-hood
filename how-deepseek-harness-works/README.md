@@ -14,7 +14,7 @@
 
 1. **一切皆插件（Cordis）**。插件向共享 `Context` 贡献服务（`ctx.llm`、`ctx.tools`、`ctx.sessions`……）、类型化事件和 effect。加载顺序不由编排决定，而由每个插件声明的 `inject` 依赖推导；依赖被替换，依赖方自动重载。→ [第 1 章](01-cordis与组装.md)
 
-2. **模型可见 ⟺ 已记录**。抵达模型请求的一切，必须能从会话日志（一条仅追加的 `SessionEvent` 流）重建，且有一个运行时不变量在每次请求发出前逐字节断言这一点。于是 fork、恢复、回放、transcript、遥测、压缩全部从同一条日志派生，系统没有第二份事实来源。→ [第 4 章](04-核心循环.md)、[第 5 章](05-会话日志与持久化.md)
+2. **模型可见 ⟺ 已记录**。抵达模型请求的一切，必须能从会话日志（一条仅追加的 `SessionEvent` 流）重建，且有一个运行时不变量在每次请求发出前逐字节断言这一点。于是 fork、恢复、回放、transcript、遥测、压缩全部从同一条日志派生，系统没有第二份事实来源。→ [第 4 章](04-核心循环.md)、[第 5 章](05-会话日志与持久化.md)、[第 13 章](13-运行时日志-trace-与遥测.md)
 
 3. **能力 seam 三角色**。每个能力（文件系统、shell、子进程、终端、沙箱、LSP、subagent……）都由三种角色组成：声明接口的 **Service Definition**、实现它的 **Service Provider**、消费它的 **Consumer**（通常是面向模型的工具）。换一个 Provider，整个产品的行为就变了——把 `ctx.fs` 和 `ctx.subprocess` 指向远程沙箱，Bash、PTY、LSP 就一并搬了过去，工具层零改动。→ [第 7 章](07-工具系统与执行世界.md)
 
@@ -34,10 +34,12 @@
 | [第 6 章](06-LLM能力层.md) | 模型适配 | 为什么有自有流式词汇表；适配器契约；一次请求的完整生命周期；重试与 token 计量 |
 | [第 7 章](07-工具系统与执行世界.md) | 工具与 seam | 工具流水线五段；seam 三角色速查；"执行世界"共享的含义；E2B 实证 |
 | [第 8 章](08-交互审批与安全.md) | 纵深防御 | 七层防御各防什么；审批生命周期；外部 hook 桥；guard 循环卫生 |
-| [第 9 章](09-编排能力.md) | 多 agent 与后台工作 | subagent 为什么是 seam；preset 的 isolate realm；jobs/workflow/plan/goal/schedule |
+| [第 9 章](09-编排能力.md) | 多 agent 与后台工作 | subagent 两种委派模式（one-shot/continuable）与六种传输；日志是真相驻留是缓存；权威与递归边界；preset 的 isolate realm；jobs/workflow/plan/goal/schedule |
 | [第 10 章](10-应用与对外接口.md) | UI 与协议 | Web UI 从浏览器到 agent-loop 的路径；为什么需要 Typert；SDK/ACP/Python 的分工 |
 | [第 11 章](11-预制的Agent模式.md) | 预制的 Agent 模式 | host/preset 两层平面；极简/标准/PTC/创造四副面孔的能力递增链 |
 | [第 12 章](12-最小复刻指南.md) | 重建最小 dsh | 复刻这个架构需要实现哪些组件、按什么顺序 |
+| [第 13 章](13-运行时日志-trace-与遥测.md) | 运行时日志、Trace 与遥测 | `ctx.logger` 与默认 bundle 为什么安静；trace 如何收集；遥测的 capture/export/脱敏链路；日志落在哪里、会不会自动清理 |
+| [第 14 章](14-上下文压缩机制.md) | 上下文压缩 | 如何在不删日志的前提下压缩模型上下文；触发策略、选区、事务锁、工具结果剪枝、不变量 |
 | [源码地图](reference.md) | 关键实现入口 | 按主题组织的文件级索引，供查证 |
 
 ## 速查：想改行为，去哪一章
@@ -52,4 +54,9 @@
 | 改审批/权限行为 | 组合 approval/permission 能力或当应答者 | [8](08-交互审批与安全.md) |
 | 加子 agent 后端 | 注册 subagent Provider | [9](09-编排能力.md) |
 | 加 UI 会话节点 | `ConversationNodeDefinition` + keyed renderer | [10](10-应用与对外接口.md) |
+| 改遥测/导出行为 | 挂 `session-telemetry/record` 瀑布或替换 telemetry backend | [13](13-运行时日志-trace-与遥测.md) |
+| 打开运行时控制台日志 | 挂载 `logger-console` 插件 | [13](13-运行时日志-trace-与遥测.md) |
+| 手动压缩历史 | `/compact` 命令或 `ctx.compaction.compactNow()` | [14](14-上下文压缩机制.md) |
+| 改压缩阈值/保留尾/摘要模型 | 调整 `dsh-compaction-basic` 配置或 `modelPolicies` | [14](14-上下文压缩机制.md) |
+| 替换压缩后端 | 注册新的 `CompactionEngine` 实现 | [14](14-上下文压缩机制.md) |
 | 换掉某一层组合 | 写 bundle 或 patch | [1](01-cordis与组装.md) |
